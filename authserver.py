@@ -487,7 +487,11 @@ if __name__ == "__main__":
     create_player_tables()
     # Reset all player resources to the high value on auth server start
     #reset_all_player_stats()
-    threading.Thread(target=command_input_loop, daemon=True).start()
+    if sys.stdin is not None and sys.stdin.isatty():
+        threading.Thread(target=command_input_loop, daemon=True).start()
+    else:
+        print("[!] stdin is not available; authserver console input disabled")
+
     try:
         app.run(host=GAME_SERVER_IP, port=900, debug=False, use_reloader=False)
     except OSError:
