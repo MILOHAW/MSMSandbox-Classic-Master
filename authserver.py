@@ -10,9 +10,14 @@ import hashlib
 import time
 import random
 import os
+import sys
 import json
 import bcrypt
 import threading
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
 
 from tools.database import get_db, db_player  # type: ignore
 from tools.utils import encrypt, get_config_value
