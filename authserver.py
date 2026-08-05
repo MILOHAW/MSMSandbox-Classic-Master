@@ -494,6 +494,10 @@ if __name__ == "__main__":
 
     try:
         app.run(host=GAME_SERVER_IP, port=900, debug=False, use_reloader=False)
-    except OSError:
-        print(f"[!] failed to bind auth server to {GAME_SERVER_IP}, falling back to 0.0.0.0")
-        app.run(host="10.128.0.3", port=900, debug=False, use_reloader=False)
+    except OSError as e:
+        print(f"[!] failed to bind auth server to {GAME_SERVER_IP}: {e}; falling back to 0.0.0.0")
+        try:
+            app.run(host="0.0.0.0", port=900, debug=False, use_reloader=False)
+        except OSError as e2:
+            print(f"[!] failed to bind auth server to 0.0.0.0: {e2}")
+            print("[!] authserver could not bind to any host; verify network interface and permissions")
