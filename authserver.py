@@ -492,12 +492,20 @@ if __name__ == "__main__":
     else:
         print("[!] stdin is not available; authserver console input disabled")
 
-    try:
-        app.run(host=GAME_SERVER_IP, port=900, debug=False, use_reloader=False)
-    except OSError as e:
-        print(f"[!] failed to bind auth server to {GAME_SERVER_IP}: {e}; falling back to 0.0.0.0")
+    tried_addrs = []
+    for addr in [GAME_SERVER_IP, "0.0.0.0", "127.0.0.1"]:
+        if addr not in tried_addrs:
+            tried_addrs.append(addr)
+
+    bound = False
+    for addr in tried_addrs:
         try:
-            app.run(host="0.0.0.0", port=900, debug=False, use_reloader=False)
-        except OSError as e2:
-            print(f"[!] failed to bind auth server to 0.0.0.0: {e2}")
-            print("[!] authserver could not bind to any host; verify network interface and permissions")
+            print(f"Attempting to start authserver on {addr}:900")
+            app.run(host=addr, port=900, debug=False, use_reloader=False)
+            bound = True
+            break
+        except OSError as e:
+            print(f"[!] failed to bind auth server to {addr}:900: {e}")
+
+    if not bound:
+        print("[!] authserver could not bind to any host; verify network interface and permissions")
