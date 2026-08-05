@@ -41,8 +41,8 @@ CURRENT_PLAYERS = 0
 MAX_PLAYERS = 1000
 
 KICK_IF_OUTDATED = True
-GAME_SERVER_IP = "10.128.0.3"
-AUTH_SERVER_IP = "10.128.0.3"
+GAME_SERVER_IP = "0.0.0.0"
+AUTH_SERVER_IP = "0.0.0.0"
 
 EVENT_LOOP = None
 ADMIN_CURRENCIES = {"coins", "food", "diamonds", "shards", "xp", "level"}
@@ -434,8 +434,28 @@ def create_player_tables():
 
 
 def reset_all_player_stats(value=1_999_999_999):
-    # No-op: currency is now persistent and should never be mass-reset at startup.
-    pass
+    # Reset all existing players to the requested starter balances.
+    try:
+        cur_player.execute(
+            "UPDATE players SET coins = ?, diamonds = ?, food = ?, shards = ?",
+            (80_000_000, 2_000, 99_000_000, 5_000),
+        )
+        db_player.commit()
+    except Exception as e:
+        print(f"[!] failed to reset player stats: {e}")
+        return
+
+    # Update currently connected player objects as well.
+    for client in list(CONNECTED_CLIENTS.values()):
+        try:
+            if hasattr(client, "player") and client.player is not None:
+                client.player.coins = 80_000_000
+                client.player.diamonds = 2_000
+                client.player.food = 99_000_000
+                client.player.shards = 5_000
+        except Exception:
+            pass
+    print("[+] reset all player stats to 80M coins, 2K diamonds, 99M food, 5K shards")
 
 async def send_extension_response(client, cmd, params):
     ext_resp = SFSObject()
@@ -2457,27 +2477,11 @@ async def handle_client(client: TCPTransport):
                     cur.execute("SELECT * FROM entities WHERE entity_id = ?", (struct_static["entity"],))
                     entity_row = cur.fetchone()
 
-                    # Deduct the clearing cost before removing the obstacle
+                    # Clearing obstacle does not cost the player any currency.
                     cost_coins = 0
                     cost_diamonds = 0
-                    if entity_row is not None:
-                        try:
-                            cost_coins = entity_row["cost_coins"] or 0
-                        except Exception:
-                            cost_coins = 0
-                        try:
-                            cost_diamonds = entity_row["cost_diamonds"] or 0
-                        except Exception:
-                            cost_diamonds = 0
 
-                    if not client.player.add_properties(coins=-cost_coins, diamonds=-cost_diamonds):
-                        response = SFSObject()
-                        response.put_bool("success", False)
-                        response.put_utf_string("error", "Not enough resources to clear obstacle")
-                        await send_extension_response(client, cmd, response)
-                        continue
-
-                    # Attempt to delete — do this after cost check to avoid race conditions
+                    # Attempt to delete the obstacle directly.
                     cur_player.execute(
                         """
                         DELETE FROM player_structures
@@ -2487,9 +2491,8 @@ async def handle_client(client: TCPTransport):
                     )
                     db_player.commit()
 
-                    # If no row was deleted, the obstacle was already removed — refund
+                    # If no row was deleted, the obstacle was already removed.
                     if cur_player.rowcount == 0:
-                        client.player.add_properties(coins=cost_coins, diamonds=cost_diamonds)
                         response = SFSObject()
                         response.put_bool("success", False)
                         response.put_utf_string("error", "Structure already removed")
