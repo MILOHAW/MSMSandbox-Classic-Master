@@ -23,9 +23,21 @@ from tools.database import get_db, db_player  # type: ignore
 from tools.utils import encrypt, get_config_value
 
 
-app = Flask(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s in %(module)s: %(message)s",
+)
 
-logging.getLogger("werkzeug").setLevel(logging.ERROR)
+app = Flask(__name__)
+app.logger.setLevel(logging.INFO)
+logging.getLogger("werkzeug").setLevel(logging.INFO)
+
+
+@app.before_request
+def log_request():
+    app.logger.info(
+        f"{request.remote_addr} {request.method} {request.path} args={request.args.to_dict()}"
+    )
 
 
 CONTENT_ROOT = os.path.join(os.path.dirname(__file__), "files")
