@@ -1,7 +1,8 @@
 from sfs2x.protocol import Message, ControllerID
 from sfs2x.core import SFSObject, SFSArray
 
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
+from cryptography.hazmat.decrepit.ciphers import modes
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import padding
 
@@ -9,6 +10,7 @@ import hashlib
 import base64
 import re
 import json
+import os
 
 from tools.database import cur_player #type: ignore
 
@@ -34,6 +36,9 @@ def debug_sfsobject(obj, path="root"):
                     print(f"❌ {path}.{key}[{i}] is None!")
 
 async def send_extension_response(client, cmd, params):
+    if cmd in {"gs_promos", "gs_quest", "ga_quest"}:
+        return
+
     ext_resp = SFSObject()
     ext_resp.put_utf_string("c", cmd)
     ext_resp.put_int("r", -1)
@@ -82,7 +87,10 @@ def _load_json_no_comments(path):
     return json.loads(text)
 
 def get_config_value(key):
-    config = _load_json_no_comments("config.json")
+    # Use absolute path to ensure config.json is found regardless of working directory
+    script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    config_path = os.path.join(script_dir, "config.json")
+    config = _load_json_no_comments(config_path)
     return config.get(key)
 
 def sanitize_name(name, alphabet):
