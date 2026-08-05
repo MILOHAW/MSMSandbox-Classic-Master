@@ -815,10 +815,10 @@ async def handle_client(client: TCPTransport):
                     """, (
                         bbb_id,
                         user_island_id, # active_island
-                        1_200,    # coins
-                        0,    # food
-                        12,    # diamonds
-                        0,    # shards
+                        80_000_000,    # coins
+                        99_000_000,    # food
+                        2_000,    # diamonds
+                        5_000,    # shards
                         0,    # xp
                         1,    # level
                         "New Player",
@@ -828,6 +828,10 @@ async def handle_client(client: TCPTransport):
                     db_player.commit()
 
                     player.active_island = user_island_id
+                    player.coins = 80_000_000
+                    player.food = 99_000_000
+                    player.diamonds = 20_000
+                    player.shards = 500_000
 
                     island = Island(bbb_id, 1, user_island_id)
                     island.create_structures()
@@ -844,12 +848,12 @@ async def handle_client(client: TCPTransport):
 
                 if not exists:
                     # New player: apply the starter values from the INSERT above
-                    player.coins = 1_200
-                    player.food = 0
-                    player.diamonds = 12
-                    player.shards = 0
+                    player.coins = 80_000_000
+                    player.food = 99_000_000
+                    player.diamonds = 2_000
+                    player.shards = 5_000
                     player.xp = 0
-                    player.level = 1
+                    player.level = 10
 
                 player.display_name = sanitize_name(player.display_name, ALPHABET)
 
