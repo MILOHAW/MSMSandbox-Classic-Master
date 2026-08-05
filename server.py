@@ -3496,7 +3496,13 @@ if __name__ == "__main__":
     create_player_tables()
     reset_all_player_stats()
     load_static_data()
-    tried_addrs = [GAME_SERVER_IP, "10.128.0.3", "10.128.0.3"]
+    tried_addrs = [GAME_SERVER_IP, "0.0.0.0", "127.0.0.1"]
+    # Deduplicate in case GAME_SERVER_IP is already 0.0.0.0 or localhost.
+    tried_addrs = []
+    for addr in [GAME_SERVER_IP, "0.0.0.0", "127.0.0.1"]:
+        if addr not in tried_addrs:
+            tried_addrs.append(addr)
+
     bound = False
     for addr in tried_addrs:
         try:
