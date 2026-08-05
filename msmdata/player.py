@@ -1,3 +1,8 @@
+#
+# player.py
+# fuck you riot
+#
+
 from sfs2x.core import SFSObject, SFSArray
 from .island import Island
 
@@ -5,32 +10,42 @@ import time
 
 from tools.database import db_player, cur_player #type: ignore
 
-MAX_RESOURCE = 1_000_000_000
+
+MAX_DISPLAY_RESOURCE = 999_999_999
+MAX_DIAMOND_RESOURCE = 9999
+MAX_LEVEL_RESOURCE = 100
+MAX_RESOURCE = 10_000_000_000
+DISPLAY_INF_VALUE = MAX_DISPLAY_RESOURCE
+
+
+def clamp_display(value):
+    # Values at or above the display cap are shown as the max display sentinel.
+    return min(value, DISPLAY_INF_VALUE)
+
 
 class Player:
     def __init__(self, bbb_id: int, display_name: str, user_id: int):
         self.bbb_id = bbb_id
         self.user_id = user_id
         self.display_name = display_name
+        self.scratch_off_purchased = False
+        self.on_currency_change = None
 
         self.islands = []
 
-        self.coins = 5000
-        self.diamonds = 20
-        self.food = 0
+        self.coins = 10000000
+        self.diamonds = 1000000
+        self.food = 50000000
         self.xp = 0
-        self.level = 30
-        self.shards = 0
+        self.level = 0
+        self.shards = 10000000
 
         self.active_island = 1
 
-        self.quests = SFSArray()
-
-    def set_quests(self, quests: SFSArray):
-        self.quests = quests
 
     def add_island(self, island: Island):
         self.islands.append(island)
+
 
     def get_active_island(self):
         for island in self.islands:
@@ -38,31 +53,57 @@ class Player:
                 return island
         return None
 
+
+    def get_monster(self, user_monster_id: int):
+        for island in self.islands:
+            for monster in island.monsters:
+                if monster.user_monster_id == user_monster_id:
+                    return monster
+        return None
+
+
+    def refresh_monster(self, monster):
+        for island in self.islands:
+            if island.user_island_id == monster.user_island_id:
+                for idx, existing in enumerate(island.monsters):
+                    if existing.user_monster_id == monster.user_monster_id:
+                        island.monsters[idx] = monster
+                        return monster
+                island.add_monster(monster)
+                return monster
+        return None
+
+
+    def remove_monster(self, user_monster_id: int):
+        for island in self.islands:
+            for idx, monster in enumerate(island.monsters):
+                if monster.user_monster_id == user_monster_id:
+                    del island.monsters[idx]
+                    return True
+        return False
+
+
     def get_properties(self):
         properties = SFSArray()
 
-        self.coins = min(self.coins, MAX_RESOURCE)
-        self.diamonds = min(self.diamonds, MAX_RESOURCE)
-        self.food = min(self.food, MAX_RESOURCE)
-
         tmp = SFSObject()
-        tmp.put_int("coins", self.coins)
+        tmp.put_int("coins", clamp_display(self.coins))
         properties.add_sfs_object(tmp)
 
         tmp = SFSObject()
-        tmp.put_int("diamonds", self.diamonds)
+        tmp.put_int("diamonds", clamp_display(self.diamonds))
         properties.add_sfs_object(tmp)
 
         tmp = SFSObject()
-        tmp.put_int("food", self.food)
+        tmp.put_int("food", clamp_display(self.food))
         properties.add_sfs_object(tmp)
 
         tmp = SFSObject()
-        tmp.put_int("xp", self.xp)
+        tmp.put_int("xp", clamp_display(self.xp))
         properties.add_sfs_object(tmp)
 
         tmp = SFSObject()
-        tmp.put_int("ethereal_currency", self.shards)
+        tmp.put_int("ethereal_currency", clamp_display(self.shards))
         properties.add_sfs_object(tmp)
 
         tmp = SFSObject()
@@ -71,11 +112,12 @@ class Player:
 
         return properties
 
+
     def _handle_level_up(self):
         if not self._levels:
             return
 
-        while self.level < 30:
+        while self.level < 100:
             next_level_data = self._levels.get(self.level + 1)
             if not next_level_data:
                 break
@@ -89,6 +131,7 @@ class Player:
             else:
                 break
 
+
     def add_properties(self, coins=0, diamonds=0, food=0, xp=0, shards=0, level=0, set=False):
         coins = round(coins)
         diamonds = round(diamonds)
@@ -96,7 +139,7 @@ class Player:
         xp = round(xp)
         shards = round(shards)
 
-        # Check for negative balances
+        # negative balances
         if self.diamonds + diamonds < 0:
             return False
         if self.coins + coins < 0:
@@ -121,9 +164,9 @@ class Player:
             self.coins = coins
             self.diamonds = diamonds
             self.food = food
-            self.xp = xp
+            self.xp = 0
             self.shards = shards
-            self.level = level
+            self.level = 99
 
         if xp > 0:
             self._handle_level_up()
@@ -131,7 +174,9 @@ class Player:
         self.coins = min(self.coins, MAX_RESOURCE)
         self.diamonds = min(self.diamonds, MAX_RESOURCE)
         self.food = min(self.food, MAX_RESOURCE)
+        self.xp = min(self.xp, MAX_RESOURCE)
         self.shards = min(self.shards, MAX_RESOURCE)
+        self.level = min(self.level, MAX_RESOURCE)
 
         cur_player.execute(
             """UPDATE players 
@@ -141,39 +186,48 @@ class Player:
         )
         db_player.commit()
 
+        if callable(self.on_currency_change):
+            try:
+                self.on_currency_change(self)
+            except Exception:
+                pass
+
         return True
+
 
     def get_sfs_object(self):
         current_time_ms = int(time.time()) * 1000
         player_object = SFSObject()
 
-        coins = min(self.coins, MAX_RESOURCE)
-        diamonds = min(self.diamonds, MAX_RESOURCE)
-        food = min(self.food, MAX_RESOURCE)
-        shards = min(self.shards, MAX_RESOURCE)
+        coins = clamp_display(self.coins)
+        diamonds = clamp_display(self.diamonds)
+        food = clamp_display(self.food)
+        xp = clamp_display(self.xp)
+        shards = clamp_display(self.shards)
 
-        self.coins = round(coins)
-        self.diamonds = round(diamonds)
-        self.food = round(food)
+        self.coins = round(self.coins)
+        self.diamonds = round(self.diamonds)
+        self.food = round(self.food)
         self.xp = round(self.xp)
-        self.shards = round(shards)
+        self.shards = round(self.shards)
 
-        player_object.put_int("coins", self.coins)
-        player_object.put_int("diamonds", self.diamonds)
-        player_object.put_int("food", self.food)
-        player_object.put_int("ethereal_currency", self.shards)
+        player_object.put_int("coins", coins)
+        player_object.put_int("diamonds", diamonds)
+        player_object.put_int("food", food)
+        player_object.put_int("ethereal_currency", shards)
 
         player_object.put_int("premium", 1)
 
         player_object.put_long("last_login", current_time_ms)
 
-        player_object.put_int("xp", self.xp)
+        player_object.put_int("xp", xp)
         player_object.put_int("level", self.level)
-        player_object.put_int("max_level", 30)
+        player_object.put_int("max_level", 100)
 
-        player_object.put_long("bbb_id", self.bbb_id)
-        player_object.put_int("user_id", self.user_id)
-        player_object.put_long("referral", 0)
+        # use put_int for IDs to match SFSObject API in this environment
+        player_object.put_int("bbb_id", int(self.bbb_id))
+        player_object.put_int("user_id", int(self.user_id))
+        player_object.put_int("referral", 0)
         player_object.put_long("active_island", self.active_island)
 
         player_object.put_int("fb_invite_reward", 1)
@@ -202,9 +256,6 @@ class Player:
         #player_object.put_int("daily_bonus_coins", 200)
         #player_object.put_int("reward_day", 1)
 
-        player_object.put_utf_string("c", "breedingAddOnBridged")
-        player_object.put_utf_string("client_tutorial_setup", "breedingAddOnBridged")
-
-        player_object.put_sfs_array("quests", self.quests)
 
         return player_object
+
