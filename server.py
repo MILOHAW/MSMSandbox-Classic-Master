@@ -9,10 +9,15 @@ import traceback
 import requests
 import base64
 import os
+import sys
 import platform
 import json
 import random
 import threading
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
 
 from flask import g
 
@@ -36,7 +41,7 @@ CURRENT_PLAYERS = 0
 MAX_PLAYERS = 1000
 
 KICK_IF_OUTDATED = True
-GAME_SERVER_IP = "0.0.0.0"
+GAME_SERVER_IP = "10.128.0.3"
 AUTH_SERVER_IP = "10.128.0.3"
 
 EVENT_LOOP = None
@@ -3488,7 +3493,7 @@ if __name__ == "__main__":
     create_player_tables()
     reset_all_player_stats()
     load_static_data()
-    tried_addrs = [GAME_SERVER_IP, "0.0.0.0", "127.0.0.1"]
+    tried_addrs = [GAME_SERVER_IP, "10.128.0.3", "10.128.0.3"]
     bound = False
     for addr in tried_addrs:
         try:
