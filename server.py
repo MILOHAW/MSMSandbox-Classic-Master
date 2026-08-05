@@ -3482,7 +3482,10 @@ async def handle_client(client: TCPTransport):
 async def run_server(ip: str, port: int):
     global EVENT_LOOP
     EVENT_LOOP = asyncio.get_running_loop()
-    threading.Thread(target=admin_console_loop, daemon=True).start()
+    if sys.stdin is not None and sys.stdin.isatty():
+        threading.Thread(target=admin_console_loop, daemon=True).start()
+    else:
+        print("[!] stdin is not available; admin console input disabled")
     print(f"Began server at {ip}:{port}")
     asyncio.create_task(poll_pending_commands())
     async for client in server_from_url(f"tcp://{ip}:{port}"):
