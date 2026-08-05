@@ -434,6 +434,11 @@ def create_player_tables():
 
 
 def reset_all_player_stats(value=1_999_999_999):
+    marker_path = os.path.join(SCRIPT_DIR, "player_reset_done.flag")
+    if os.path.exists(marker_path):
+        print("[i] player reset already applied; skipping one-time reset")
+        return
+
     # Reset all existing players to the requested starter balances.
     try:
         cur_player.execute(
@@ -455,6 +460,13 @@ def reset_all_player_stats(value=1_999_999_999):
                 client.player.shards = 5_000
         except Exception:
             pass
+
+    try:
+        with open(marker_path, "w", encoding="utf-8") as marker_file:
+            marker_file.write("reset applied")
+    except Exception as e:
+        print(f"[!] failed to write reset marker: {e}")
+
     print("[+] reset all player stats to 80M coins, 2K diamonds, 99M food, 5K shards")
 
 async def send_extension_response(client, cmd, params):
@@ -599,6 +611,34 @@ async def poll_pending_commands():
             pass
 
         await asyncio.sleep(POLL_INTERVAL)
+
+async def send_daily_reward_message(client, amount: int, resource: str):
+    msg = SFSObject()
+    msg.put_bool("force_logout", False)
+    msg.put_utf_string("msg", f"YOU GOT YOUR DAILY REWARD: {amount} {resource}")
+    await send_extension_response(client, "gs_display_generic_message", msg)
+
+async def award_daily_reward_to_client(client):
+    if not hasattr(client, "player") or client.player is None:
+        return
+
+    resource = random.choice(["coins", "diamonds", "food", "shards"])
+    amount = random.randint(1, 1000)
+    if client.player.add_properties(**{resource: amount}):
+        await send_daily_reward_message(client, amount, resource)
+
+async def daily_reward_loop():
+    while True:
+        await asyncio.sleep(24 * 3600)
+        if not CONNECTED_CLIENTS:
+            continue
+
+        for client in list(CONNECTED_CLIENTS.values()):
+            try:
+                await award_daily_reward_to_client(client)
+            except Exception as e:
+                print(f"[!] failed to award daily reward to player: {e}")
+
 
 def buy_entity(client, entity_id):
     cur.execute("SELECT * FROM entities WHERE entity_id = ?", (entity_id,))
@@ -3495,6 +3535,7 @@ async def run_server(ip: str, port: int):
         print("[!] stdin is not available; admin console input disabled")
     print(f"Began server at {ip}:{port}")
     asyncio.create_task(poll_pending_commands())
+    asyncio.create_task(daily_reward_loop())
     async for client in server_from_url(f"tcp://{ip}:{port}"):
         print(f"New client connected: {client.host}:{client.port}")
         asyncio.create_task(handle_client(client))
