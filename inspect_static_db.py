@@ -1,0 +1,11 @@
+import sqlite3, os
+static_db_path = os.path.join(os.path.dirname(os.path.abspath('msmdata/island.py')), 'static_dbs.db')
+conn = sqlite3.connect(static_db_path)
+cur = conn.cursor()
+cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+print(cur.fetchall())
+cur.execute("PRAGMA table_info(monsters)")
+print(cur.fetchall())
+cur.execute('SELECT monster_id, name, entity FROM monsters LIMIT 5')
+print(cur.fetchall())
+conn.close()

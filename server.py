@@ -10,31 +10,44 @@ import requests
 import base64
 import os
 import platform
+import json
+import random
+import threading
 
 from flask import g
 
 from room import Room
 
 from msmdata.player import Player
-from msmdata.island import Island
+from msmdata.island import Island, cur as static_cur
 from msmdata.structure import Structure
 from msmdata.egg import Egg # type: ignore
-from msmdata.monster import Monster #type: ignore
+from msmdata.monster import Monster, get_monster_position_state, record_monster_position #type: ignore
 from msmdata.megadata import MegaData # type: ignore
 from msmdata.breeding import Breeding # type: ignore
 
 from msmdata.get_data import *
 
-from tools.utils import player_exists, sanitize_name, normalize_text, invalid_name
+from tools.utils import player_exists, sanitize_name, normalize_text, invalid_name, decrypt, get_config_value, send_extension_response
 
 from tools.database import cur_player, db_player # type: ignore
 
 CURRENT_PLAYERS = 0
-MAX_PLAYERS = 200
+MAX_PLAYERS = 1000
 
 KICK_IF_OUTDATED = True
 GAME_SERVER_IP = "0.0.0.0"
-AUTH_SERVER_IP = "18.215.25.63"
+AUTH_SERVER_IP = "10.128.0.3"
+
+EVENT_LOOP = None
+ADMIN_CURRENCIES = {"coins", "food", "diamonds", "shards", "xp", "level"}
+
+GOLD_ISLAND_ID = 6
+ETHEREAL_ISLAND_ID = 7
+SHUGGA_ISLAND_ID = 8
+
+CRYPT_KEY = get_config_value("key")
+CRYPT_IV = get_config_value("iv")
 
 dev = platform.system() == "Windows"
 
@@ -45,10 +58,194 @@ ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!¨\"#$&'()*+,-.
 
 if platform.system() == "Windows":
     KICK_IF_OUTDATED = False
-    AUTH_SERVER_IP = "192.168.1.16"
+    AUTH_SERVER_IP = GAME_SERVER_IP
     GAME_SERVER_IP = AUTH_SERVER_IP
 
 DATA_CACHE = {}
+
+
+CONNECTED_CLIENTS = {}
+
+POLL_INTERVAL = 5.0          
+IDLE_POLL_INTERVAL = 15.0    
+
+
+def get_connected_player_summary() -> str:
+    if not CONNECTED_CLIENTS:
+        return "No connected players."
+
+    lines = ["Connected players:"]
+    for player_id, client in CONNECTED_CLIENTS.items():
+        player = getattr(client, "player", None)
+        name = player.display_name if player is not None else "unknown"
+        lines.append(f"  {player_id}: {name}")
+    return "\n".join(lines)
+
+
+async def send_player_properties_update(client):
+    if not hasattr(client, "player") or client.player is None:
+        return
+
+    response = SFSObject()
+    response.put_sfs_array("properties", client.player.get_properties())
+    await send_extension_response(client, "gs_update_properties", response)
+
+
+def refresh_cached_monster(client, monster):
+    if not hasattr(client, "player") or client.player is None:
+        return
+    client.player.refresh_monster(monster)
+    record_monster_position(monster.user_island_id, monster.user_monster_id, monster.x, monster.y)
+
+
+async def auto_update_monster_names(client):
+    """Removed: no longer forcibly renames monsters."""
+    pass
+
+
+async def handle_pending_command(command):
+    command_name = str(command.get("command") or "").strip().lower()
+    payload = command.get("payload", {})
+    target_id = command.get("target_bbb_id")
+
+    if command_name == "gs_display_generic_message":
+        msg = SFSObject()
+        msg.put_bool("force_logout", payload.get("force_logout", False))
+        msg.put_utf_string("msg", payload.get("msg", ""))
+
+        if target_id is not None and target_id in CONNECTED_CLIENTS:
+            client = CONNECTED_CLIENTS[target_id]
+            await send_extension_response(client, "gs_display_generic_message", msg)
+        else:
+            for client in list(CONNECTED_CLIENTS.values()):
+                await send_extension_response(client, "gs_display_generic_message", msg)
+        return
+
+    if command_name == "give_currency":
+        if target_id is None:
+            print("[!] pending give_currency missing target_bbb_id")
+            return
+
+        currency = payload.get("currency")
+        amount = payload.get("amount")
+        if currency not in {"coins", "food", "diamonds", "shards", "xp", "level"}:
+            print(f"[!] invalid currency '{currency}' in pending command")
+            return
+
+        try:
+            amount = int(amount)
+        except (TypeError, ValueError):
+            print("[!] invalid amount in pending give_currency command")
+            return
+
+        client = CONNECTED_CLIENTS.get(target_id)
+        if client is not None and hasattr(client, "player") and client.player is not None:
+            success = client.player.add_properties(**{currency: amount})
+            if success:
+                await send_player_properties_update(client)
+                print(f"[+] applied give_currency for connected player {target_id}: {amount} {currency}")
+            else:
+                print(f"[!] failed to apply give_currency for connected player {target_id}")
+            return
+
+        # Fallback for offline players: update DB directly.
+        cur_player.execute(
+            f"UPDATE players SET {currency} = {currency} + ? WHERE bbb_id = ?",
+            (amount, target_id)
+        )
+        db_player.commit()
+        if cur_player.rowcount == 0:
+            print(f"[!] offline player {target_id} not found for give_currency")
+        else:
+            print(f"[+] updated offline player {target_id}: {amount} {currency}")
+        return
+
+    print(f"[!] unknown pending command: {command_name}")
+
+
+async def poll_pending_commands():
+    while True:
+        try:
+            response = requests.get(f"http://{AUTH_SERVER_IP}:900/commands", timeout=5)
+            response.raise_for_status()
+            data = response.json()
+            commands = data.get("commands", [])
+        except Exception as e:
+            print(f"[!] failed to poll pending commands: {e}")
+            await asyncio.sleep(POLL_INTERVAL)
+            continue
+
+        for command in commands:
+            try:
+                await handle_pending_command(command)
+            except Exception as e:
+                print(f"[!] error handling pending command {command}: {e}")
+
+        await asyncio.sleep(POLL_INTERVAL)
+
+
+def admin_console_loop() -> None:
+    print("[+] admin console commands:")
+    print("    show userid                        - list connected players by bbb_id")
+    print("    give <id> <currency> <value>      - add currency to a connected player")
+
+    while True:
+        try:
+            raw = input().strip()
+        except EOFError:
+            break
+
+        if not raw:
+            continue
+
+        tokens = raw.split()
+        command = tokens[0].lower()
+
+        if raw.lower() == "show userid":
+            print(get_connected_player_summary())
+            continue
+
+        if command == "give" and len(tokens) == 4:
+            try:
+                player_id = int(tokens[1])
+            except ValueError:
+                print("[!] Player id must be an integer")
+                continue
+
+            currency = tokens[2].lower()
+            if currency not in ADMIN_CURRENCIES:
+                print(f"[!] Unsupported currency '{currency}'. Allowed: {', '.join(sorted(ADMIN_CURRENCIES))}")
+                continue
+
+            try:
+                amount = int(tokens[3])
+            except ValueError:
+                print("[!] Value must be an integer")
+                continue
+
+            client = CONNECTED_CLIENTS.get(player_id)
+            if client is None:
+                print(f"[!] Player {player_id} is not currently connected")
+                continue
+
+            success = client.player.add_properties(**{currency: amount})
+            if not success:
+                print(f"[!] Failed to add {currency} to player {player_id}")
+                continue
+
+            try:
+                if EVENT_LOOP is not None:
+                    future = asyncio.run_coroutine_threadsafe(send_player_properties_update(client), EVENT_LOOP)
+                    future.result(timeout=5)
+            except Exception as exc:
+                print(f"[!] Currency granted but failed to send update: {exc}")
+                continue
+
+            print(f"[+] Granted {amount} {currency} to player {player_id}")
+            continue
+
+        print("[!] unknown command. Use 'show userid' or 'give <id> <currency> <value>'")
+
 
 def table_exists(cursor, table_name):
     cursor.execute("""
@@ -56,6 +253,23 @@ def table_exists(cursor, table_name):
         WHERE type='table' AND name=?
     """, (table_name,))
     return cursor.fetchone() is not None
+
+def table_has_column(cursor, table_name, column_name):
+    cursor.execute(f"PRAGMA table_info({table_name})")
+    rows = cursor.fetchall()
+    return any(row[1] == column_name for row in rows)
+
+
+def get_monster_name(monster_row):
+    if monster_row is None:
+        return "Monster"
+    try:
+        if "name" in monster_row.keys():
+            return monster_row["name"] or "Monster"
+    except Exception:
+        pass
+    return "Monster"
+
 
 def create_player_tables():
     tables = {
@@ -111,8 +325,9 @@ def create_player_tables():
                 muted INTEGER DEFAULT 0,
                 level INTEGER DEFAULT 1,
                 date_created INTEGER,
-                happiness INTEGER DEFAULT 50,
+                happiness INTEGER DEFAULT 0,
                 monster INTEGER,
+                name TEXT DEFAULT 'Monster',
                 volume REAL DEFAULT 1.0,
                 times_fed INTEGER DEFAULT 0,
                 collected_coins INTEGER DEFAULT 0,
@@ -197,7 +412,25 @@ def create_player_tables():
         else:
             print(f"ℹTable '{name}' already exists.")
 
+    if table_exists(cur_player, "player_monsters") and not table_has_column(cur_player, "player_monsters", "name"):
+        try:
+            cur_player.execute("ALTER TABLE player_monsters ADD COLUMN name TEXT DEFAULT 'Monster'")
+            print("Column 'name' added to player_monsters.")
+        except Exception as e:
+            print(f"[!] Failed to add 'name' column to player_monsters: {e}")
+
+    if table_exists(cur_player, "player_monsters") and table_has_column(cur_player, "player_monsters", "name"):
+        try:
+            cur_player.execute("UPDATE player_monsters SET name = 'Monster' WHERE name IS NULL")
+        except Exception as e:
+            print(f"[!] Failed to populate default monster names: {e}")
+
     db_player.commit()
+
+
+def reset_all_player_stats(value=1_999_999_999):
+    # No-op: currency is now persistent and should never be mass-reset at startup.
+    pass
 
 async def send_extension_response(client, cmd, params):
     ext_resp = SFSObject()
@@ -246,14 +479,113 @@ def get_game_setting_from_key(search_key):
             return obj.get("value")
     return None
 
+
+async def poll_pending_commands():
+    """Poll the auth server for pending commands and forward them to clients.
+
+    This function avoids polling when no clients are connected and uses
+    a longer idle interval to reduce authserver /commands requests.
+    """
+    while True:
+        try:
+            if not CONNECTED_CLIENTS:
+                await asyncio.sleep(IDLE_POLL_INTERVAL)
+                continue
+
+            resp = await asyncio.to_thread(requests.get, f"http://{AUTH_SERVER_IP}:900/commands", timeout=5)
+            data = await asyncio.to_thread(lambda: resp.json())
+            if data.get("ok"):
+                commands = data.get("commands", [])
+                for cmd in commands:
+                    command = cmd.get("command")
+                    payload = cmd.get("payload", {}) or {}
+                    target = cmd.get("target_bbb_id")
+
+                    if command == "gs_display_generic_message":
+                        msg = SFSObject()
+                        msg.put_bool("force_logout", bool(payload.get("force_logout", False)))
+                        msg_text = payload.get("msg", "")
+                        msg.put_utf_string("msg", str(msg_text))
+
+                        if target is not None:
+                            try:
+                                target_id = int(target)
+                            except Exception:
+                                target_id = None
+
+                            if target_id is not None and target_id in CONNECTED_CLIENTS:
+                                client = CONNECTED_CLIENTS.get(target_id)
+                                try:
+                                    await send_extension_response(client, "gs_display_generic_message", msg)
+                                except Exception:
+                                    pass
+                        else:
+                            # broadcast to all connected clients
+                            for client in list(CONNECTED_CLIENTS.values()):
+                                try:
+                                    await send_extension_response(client, "gs_display_generic_message", msg)
+                                except Exception:
+                                    pass
+                    elif command == "give_currency":
+                        currency = str(payload.get("currency", "")).lower()
+                        amount = payload.get("amount")
+                        if currency not in {"coins", "food", "diamonds", "shards", "xp", "level"}:
+                            print(f"[!] invalid currency in pending give_currency: {currency}")
+                        else:
+                            try:
+                                amount = int(amount)
+                            except (TypeError, ValueError):
+                                print(f"[!] invalid amount in pending give_currency: {amount}")
+                                amount = None
+
+                            if amount is not None:
+                                if target is not None:
+                                    try:
+                                        target_id = int(target)
+                                    except Exception:
+                                        target_id = None
+                                else:
+                                    target_id = None
+
+                                if target_id is not None and target_id in CONNECTED_CLIENTS:
+                                    client = CONNECTED_CLIENTS[target_id]
+                                    success = client.player.add_properties(**{currency: amount})
+                                    if success:
+                                        try:
+                                            await send_player_properties_update(client)
+                                        except Exception:
+                                            pass
+                                        print(f"[+] applied give_currency to connected player {target_id}: {amount} {currency}")
+                                    else:
+                                        print(f"[!] failed to apply give_currency to connected player {target_id}")
+                                else:
+                                    cur_player.execute(
+                                        f"UPDATE players SET {currency} = {currency} + ? WHERE bbb_id = ?",
+                                        (amount, target_id if target_id is not None else -1)
+                                    )
+                                    db_player.commit()
+                                    if cur_player.rowcount == 0:
+                                        print(f"[!] offline player {target_id} not found for give_currency")
+                                    else:
+                                        print(f"[+] updated offline player {target_id}: {amount} {currency}")
+
+        except Exception:
+            # ignore transient errors and retry
+            pass
+
+        await asyncio.sleep(POLL_INTERVAL)
+
 def buy_entity(client, entity_id):
     cur.execute("SELECT * FROM entities WHERE entity_id = ?", (entity_id,))
     row = cur.fetchone()
 
-    if row["entity_type"] != "structure":
-        worked = client.player.add_properties(-row["cost_coins"], -row["cost_diamonds"], 0, 0, -row["cost_eth_currency"])
-    else:
-        worked = client.player.add_properties(0, -row["cost_diamonds"], 0, 0, 0)
+    worked = client.player.add_properties(
+        -row["cost_coins"],
+        -row["cost_diamonds"],
+        0,
+        0,
+        -row["cost_eth_currency"],
+    )
 
     return worked
 
@@ -285,7 +617,7 @@ def get_breeding_result(monster_1, monster_2, level1, level2, player_level=None)
             base_prob = combo["probability"]
             modifier = combo["modifier"]
 
-            breed_chance = 50 
+            breed_chance = 1999999 
             '''calculate_probability_for_breeding(
                 level1, level2, base_prob, modifier
             )'''
@@ -357,7 +689,7 @@ async def handle_client(client: TCPTransport):
 
                 payload = {"bbb_id": bbb_id, "game_id": 1}
 
-                verification = requests.post("http://18.215.25.63:900/verify_user", json=payload).json()
+                verification = requests.post(f"http://127.0.0.1:900/verify_user", json=payload).json()
 
                 ok = verification["ok"]
 
@@ -385,7 +717,15 @@ async def handle_client(client: TCPTransport):
 
                 exists = player_exists(bbb_id)
 
-                session_data = json.loads(base64.b64decode(verification["session_id"]).decode('utf-8'))     
+                try:
+                    session_json = decrypt(verification["session_id"], CRYPT_IV, CRYPT_KEY)
+                    session_data = json.loads(session_json)
+                except (UnicodeDecodeError, json.JSONDecodeError, Exception) as e:
+                    print(f"Error decrypting/parsing session data: {e}")
+                    ban = SFSObject()
+                    ban.put_utf_string("reason", "Session data is invalid. Please re-login.")
+                    await send_extension_response(client, "gs_player_banned", ban)
+                    return
 
                 user_id = session_data["user_id"] 
 
@@ -393,12 +733,20 @@ async def handle_client(client: TCPTransport):
 
                 if exists:
                     cur_player.execute("""
-                        SELECT active_island, display_name FROM players WHERE bbb_id = ?
+                        SELECT active_island, display_name, coins, food, diamonds, shards, xp, level
+                        FROM players WHERE bbb_id = ?
                     """, (bbb_id,))
                     row = cur_player.fetchone()
 
                     player.active_island = row["active_island"]
                     player.display_name = row["display_name"] or "New Player"
+
+                    player.coins = row["coins"]
+                    player.food = row["food"]
+                    player.diamonds = row["diamonds"]
+                    player.shards = row["shards"]
+                    player.xp = row["xp"]
+                    player.level = row["level"]
 
                     cur_player.execute("""
                         SELECT * FROM player_islands WHERE bbb_id = ?
@@ -442,12 +790,12 @@ async def handle_client(client: TCPTransport):
                     """, (
                         bbb_id,
                         user_island_id, # active_island
-                        1200,           # coins
-                        0,              # food
-                        12,             # diamonds
-                        0,              # shards
-                        0,              # xp
-                        1,              # level
+                        1_200,    # coins
+                        0,    # food
+                        12,    # diamonds
+                        0,    # shards
+                        0,    # xp
+                        1,    # level
                         "New Player",
                         current_time_ms
                     ))
@@ -458,72 +806,73 @@ async def handle_client(client: TCPTransport):
 
                     island = Island(bbb_id, 1, user_island_id)
                     island.create_structures()
+                    
+                    # Load the newly created structures into the island object
+                    island.add_player_structures()
+                    island.add_player_eggs()
+                    island.add_player_breedings()
 
                     player.add_island(island)
 
-                query = "SELECT coins, diamonds, food, xp, level FROM players WHERE bbb_id = ?"
-                cur_player.execute(query, (bbb_id,))
-                row = cur_player.fetchone()
+                # Ensure level table is available before applying XP/level changes
+                player._levels = DATA_CACHE["levels_dict"]
 
-                player.coins = row["coins"]
-                player.diamonds = row["diamonds"]
-                player.food = row["food"]
-                player.level = row["level"]
-                player.xp = row["xp"]
+                if not exists:
+                    # New player: apply the starter values from the INSERT above
+                    player.coins = 1_200
+                    player.food = 0
+                    player.diamonds = 12
+                    player.shards = 0
+                    player.xp = 0
+                    player.level = 1
 
                 player.display_name = sanitize_name(player.display_name, ALPHABET)
 
-                player._levels = DATA_CACHE["levels_dict"]
-
                 client.player = player
 
-                msg = SFSObject()
-                msg.put_bool("force_logout", False)
-                msg.put_utf_string("msg", f"Welcome to MSM Sandbox classic!\n\nOnline: ({CURRENT_PLAYERS}/{MAX_PLAYERS})")
+                # register connected client so server can push queued commands
+                try:
+                    CONNECTED_CLIENTS[player.bbb_id] = client
+                except Exception:
+                    pass
+                
+                # Start background task to auto-update all monster names every second
+                asyncio.create_task(auto_update_monster_names(client))
 
-                await send_extension_response(client, "gs_display_generic_message", msg)
-
-                if exists != True:
-                    async def _send_referral():
-                        await asyncio.sleep(5)
-                        msg = SFSObject()
-                        msg.put_bool("force_logout", False)
-                        msg.put_utf_string("msg", "Make sure to use the referral code '132026' for 999 million currency!!")
-                        await send_extension_response(client, "gs_display_generic_message", msg)
-
-                    asyncio.create_task(_send_referral())
             else:
-                cmd = payload.get("c")
+                cmd = payload.get("c") or ""
+                cmd_lower = str(cmd).strip().lower()
                 print(cmd)
-                if cmd == "db_gene":
+                if cmd_lower == "db_gene":
                     response = SFSObject()
                     response.put_sfs_array("genes_data", DATA_CACHE["genes"])
                     response.put_long("server_time", current_time_ms)
                     response.put_long("last_updated", current_time_ms)
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "db_island":
+                elif cmd_lower == "db_island":
                     response = SFSObject()
                     response.put_sfs_array("islands_data", DATA_CACHE["islands"])
                     response.put_long("server_time", current_time_ms)
                     response.put_long("last_updated", current_time_ms)
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "db_island_torches":
+                elif cmd_lower == "db_island_torches":
                     response = SFSObject()
                     response.put_sfs_array("island_torch_data", DATA_CACHE["torches"])
                     response.put_long("server_time", current_time_ms)
                     response.put_long("last_updated", current_time_ms)
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "db_monster":
+                elif cmd_lower == "db_monster":
+                    DATA_CACHE["monsters"] = get_monsters()
                     response = SFSObject()
                     response.put_sfs_array("monsters_data", DATA_CACHE["monsters"])
                     response.put_long("server_time", current_time_ms)
                     response.put_long("last_updated", current_time_ms)
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "db_store":
+                elif cmd_lower == "db_store":
                     store_items = DATA_CACHE["store_items"]
                     store_groups = DATA_CACHE["store_groups"]
                     store_currencys = DATA_CACHE["store_currencys"]
@@ -537,32 +886,32 @@ async def handle_client(client: TCPTransport):
                     response.put_long("last_updated", current_time_ms)
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "db_structure":
+                elif cmd_lower == "db_structure":
                     response = SFSObject()
                     response.put_sfs_array("structures_data", DATA_CACHE["structures"])
                     response.put_long("server_time", current_time_ms)
                     response.put_long("last_updated", current_time_ms)
                         
                     await send_extension_response(client, cmd, response)
-                elif cmd == "db_level":
+                elif cmd_lower == "db_level":
                     response = SFSObject()
                     response.put_sfs_array("level_data", DATA_CACHE["levels"])
                     response.put_long("server_time", current_time_ms)
                     response.put_long("last_updated", current_time_ms)
                         
                     await send_extension_response(client, cmd, response)
-                elif cmd == "db_scratch_offs":
+                elif cmd_lower == "db_scratch_offs":
                     response = SFSObject()
                     response.put_sfs_array("scratch_offs", DATA_CACHE["scratchoffs"])
                     response.put_long("server_time", current_time_ms)
                     response.put_long("last_updated", current_time_ms)
                         
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_promos":
+                elif cmd_lower == "gs_promos":
                     response = SFSObject()
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_timed_events":
+                elif cmd_lower == "gs_timed_events":
                     response = SFSObject()
 
                     response.put_sfs_array("timed_event_list", DATA_CACHE["timed_events"])
@@ -570,14 +919,14 @@ async def handle_client(client: TCPTransport):
                     response.put_long("last_updated", current_time_ms)
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_quest":
+                elif cmd_lower == "gs_quest":
                     response = SFSObject()
                     response.put_sfs_array("result", DATA_CACHE["quests"])
 
                     response.put_long("server_time", current_time_ms)
                     response.put_long("last_updated", current_time_ms)
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_buy_island":
+                elif cmd_lower == "gs_buy_island":
                     island_id = int(params.get("island_id"))
                     response = SFSObject()
 
@@ -633,7 +982,7 @@ async def handle_client(client: TCPTransport):
                     response.put_sfs_object("user_island", new_island.get_sfs_object())
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_change_island":
+                elif cmd_lower == "gs_change_island":
                     user_island_id = params.get("user_island_id")
                     bbb_id = client.player.bbb_id
 
@@ -665,8 +1014,7 @@ async def handle_client(client: TCPTransport):
                     response.put_sfs_object("hidden_objects", hidden_objects)
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_buy_egg":
-                    print(params)
+                elif cmd_lower == "gs_buy_egg":
                     response = SFSObject()
 
                     monster_id = params.get("monster_id")
@@ -703,13 +1051,84 @@ async def handle_client(client: TCPTransport):
 
                         egg = Egg(client.player.active_island, current_time_ms, endtime, monster_id, user_egg_id, row["user_structure_id"])
 
+                        cur_player.execute(
+                            "SELECT * FROM player_eggs WHERE user_egg_id = ?",
+                            (user_egg_id,)
+                        )
+                        egg_row = cur_player.fetchone()
+
+                        if egg_row:
+                            new_egg = Egg(
+                                egg_row["user_island_id"],
+                                egg_row["laid_on"],
+                                egg_row["hatches_on"],
+                                egg_row["monster"],
+                                egg_row["user_egg_id"],
+                                egg_row["user_structure_id"],
+                            )
+
+                            eggs_array = SFSArray()
+                            eggs_array.add_sfs_object(new_egg.get_sfs_object())
+
+                            update_resp = SFSObject()
+                            update_resp.put_sfs_array("eggs", eggs_array)
+
+                            await send_extension_response(client, "gs_update_eggs", update_resp)
+
                         response.put_sfs_object("user_egg", egg.get_sfs_object())
                         response.put_bool("success", True)
                         response.put_bool("remove_buyback", False)
                         response.put_sfs_array("properties", client.player.get_properties())
-                    print(response)
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_speed_up_hatching":
+                elif cmd_lower == "gs_sell_egg":
+                    user_egg_id = params.get("user_egg_id")
+                    response = SFSObject()
+
+                    if user_egg_id is None:
+                        response.put_bool("success", False)
+                        response.put_utf_string("message", "Invalid egg ID")
+                        await send_extension_response(client, cmd, response)
+                        continue
+
+                    cur_player.execute(
+                        "SELECT * FROM player_eggs WHERE user_island_id = ? AND user_egg_id = ?",
+                        (client.player.active_island, user_egg_id)
+                    )
+                    egg_row = cur_player.fetchone()
+
+                    if egg_row is None:
+                        response.put_bool("success", False)
+                        response.put_utf_string("message", "Egg not found")
+                        await send_extension_response(client, cmd, response)
+                        continue
+
+                    monster_id = egg_row["monster"]
+                    cur.execute("SELECT * FROM monsters WHERE monster_id = ?", (monster_id,))
+                    monster_row = cur.fetchone()
+
+                    refund_coins = 0
+                    refund_diamonds = 0
+                    if monster_row is not None:
+                        cur.execute("SELECT * FROM entities WHERE entity_id = ?", (monster_row["entity"],))
+                        entity_row = cur.fetchone()
+                        if entity_row is not None:
+                            refund_coins = int(entity_row["cost_coins"] * 0.75)
+                            refund_diamonds = int(entity_row["cost_diamonds"] * 0.75)
+
+                    if refund_coins or refund_diamonds:
+                        client.player.add_properties(coins=refund_coins, diamonds=refund_diamonds)
+
+                    cur_player.execute(
+                        "DELETE FROM player_eggs WHERE user_egg_id = ?",
+                        (user_egg_id,)
+                    )
+                    db_player.commit()
+
+                    response.put_bool("success", True)
+                    response.put_long("user_egg_id", user_egg_id)
+                    response.put_sfs_array("properties", client.player.get_properties())
+                    await send_extension_response(client, cmd, response)
+                elif cmd_lower == "gs_speed_up_hatching":
                     user_egg_id = params.get("user_egg_id")
 
                     cur_player.execute(
@@ -744,9 +1163,11 @@ async def handle_client(client: TCPTransport):
                     response.put_sfs_array("properties", client.player.get_properties())
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_hatch_egg":
+                elif cmd_lower == "gs_hatch_egg":
                     pos_x = params.get("pos_x")
                     pos_y = params.get("pos_y")
+                    pos_x = int(pos_x) if pos_x not in (None, "") else 1
+                    pos_y = int(pos_y) if pos_y not in (None, "") else 1
                     flip = int(bool(params.get("flip")))
                     user_egg_id = params.get("user_egg_id")
                     response = SFSObject()
@@ -772,6 +1193,7 @@ async def handle_client(client: TCPTransport):
                     )
                     db_player.commit()
 
+                    new_name = "Monster"
                     cur_player.execute(
                         """
                         INSERT INTO player_monsters (
@@ -780,11 +1202,14 @@ async def handle_client(client: TCPTransport):
                             pos_y,
                             flip,
                             level,
+                            happiness,
                             date_created,
                             monster,
+                            name,
+                            volume,
                             last_collection
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             client.player.active_island,
@@ -792,8 +1217,11 @@ async def handle_client(client: TCPTransport):
                             pos_y,
                             flip,
                             1,
+                            0,
                             current_time_ms,
                             monster_id,
+                            new_name,
+                            1.0,
                             current_time_ms
                         )
                     )
@@ -802,7 +1230,7 @@ async def handle_client(client: TCPTransport):
 
                     cur_player.execute(
                         """
-                        SELECT user_monster_id
+                        SELECT *
                         FROM player_monsters
                         WHERE user_island_id = ?
                         ORDER BY user_monster_id DESC
@@ -824,7 +1252,8 @@ async def handle_client(client: TCPTransport):
                     else:
                         client.player.add_properties(xp=row2["xp"])
 
-                    newMonster = Monster(client.player.active_island, user_monster_id, monster_id, pos_x, pos_y, flip, 1, 50, 0, 0, 1.0, current_time_ms, current_time_ms, 0)
+                    newMonster = Monster(client.player.active_island, user_monster_id, monster_id, pos_x, pos_y, flip, 1, 0, 0, 0, 1.0, current_time_ms, current_time_ms, 0, name=get_monster_name(monster_row))
+                    refresh_cached_monster(client, newMonster)
 
                     response.put_sfs_array("properties", client.player.get_properties())
                     response.put_long("user_egg_id", user_egg_id)
@@ -841,12 +1270,18 @@ async def handle_client(client: TCPTransport):
 
                     plrisland.add_monster(newMonster)
 
+                    hatch_resp = SFSObject()
+                    hatch_resp.put_bool("success", True)
+                    hatch_resp.put_long("user_monster_id", user_monster_id)
+                    hatch_resp.put_sfs_object("monster", newMonster.get_sfs_object())
+                    await send_extension_response(client, "gs_update_monster", hatch_resp)
+
                     player_response = SFSObject()
                     player_response.put_sfs_object("player_object", client.player.get_sfs_object())
                     player_response.put_long("server_time", current_time_ms)
 
                     await send_extension_response(client, "gs_player", player_response)
-                elif cmd == "gs_buy_structure":
+                elif cmd_lower == "gs_buy_structure":
                     x = params.get("pos_x")
                     y = params.get("pos_y")
                     flip = params.get("flip")
@@ -901,16 +1336,192 @@ async def handle_client(client: TCPTransport):
                     cur_player.execute("SELECT user_structure_id FROM player_structures WHERE user_island_id = ? AND pos_x = ? AND pos_y = ?", (client.player.active_island, x, y))
                     row = cur_player.fetchone()
 
-                    newStructure = Structure(client.player.active_island, row["user_structure_id"], structure_id, x, y, flip, scale, current_time_ms)
+                    newStructure = Structure(
+                        client.player.active_island,
+                        row["user_structure_id"],
+                        structure_id,
+                        x,
+                        y,
+                        flip,
+                        scale,
+                        current_time_ms,
+                        current_time_ms,
+                        current_time_ms,
+                        0,
+                        0,
+                    )
 
                     response = SFSObject()
+
+                    cur_player.execute(
+                        "SELECT * FROM player_structures WHERE user_structure_id = ?",
+                        (row["user_structure_id"],)
+                    )
+                    structure_row = cur_player.fetchone()
+
+                    if structure_row:
+                        updated_structure = Structure(
+                            structure_row["user_island_id"],
+                            structure_row["user_structure_id"],
+                            structure_row["structure"],
+                            structure_row["pos_x"],
+                            structure_row["pos_y"],
+                            structure_row["flip"],
+                            structure_row["scale"],
+                            structure_row["date_created"],
+                            structure_row["building_completed"],
+                            structure_row["last_collection"],
+                            structure_row["obj_data"],
+                            structure_row["obj_end"],
+                        )
+
+                        structures_array = SFSArray()
+                        structures_array.add_sfs_object(updated_structure.get_sfs_object())
+
+                        update_resp = SFSObject()
+                        update_resp.put_sfs_array("structures", structures_array)
+
+                        await send_extension_response(client, "gs_update_structures", update_resp)
 
                     response.put_bool("success", True)
                     response.put_sfs_array("properties", client.player.get_properties())
                     response.put_sfs_object("user_structure", newStructure.get_sfs_object())
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_mute_monster":
+                elif cmd_lower == "gs_start_upgrade_structure":
+                    user_structure_id = params.get("user_structure_id")
+                    response = SFSObject()
+
+                    if user_structure_id is None:
+                        response.put_bool("success", False)
+                        response.put_utf_string("message", "No structure specified")
+                        await send_extension_response(client, cmd, response)
+                        continue
+
+                    cur_player.execute(
+                        "SELECT * FROM player_structures WHERE user_structure_id = ? AND user_island_id = ?",
+                        (user_structure_id, client.player.active_island)
+                    )
+                    structure_row = cur_player.fetchone()
+
+                    if structure_row is None:
+                        response.put_bool("success", False)
+                        response.put_utf_string("message", "Structure not found")
+                        await send_extension_response(client, cmd, response)
+                        continue
+
+                    if structure_row["is_upgrading"] == 1:
+                        response.put_bool("success", False)
+                        response.put_utf_string("message", "Structure already upgrading")
+                        await send_extension_response(client, cmd, response)
+                        continue
+
+                    cur.execute("SELECT * FROM structures WHERE structure_id = ?", (structure_row["structure"],))
+                    current_structure = cur.fetchone()
+                    if current_structure is None:
+                        response.put_bool("success", False)
+                        response.put_utf_string("message", "Current structure data missing")
+                        await send_extension_response(client, cmd, response)
+                        continue
+
+                    next_structure_id = current_structure["upgrades_to"]
+                    if not next_structure_id:
+                        response.put_bool("success", False)
+                        response.put_utf_string("message", "No upgrade available")
+                        await send_extension_response(client, cmd, response)
+                        continue
+
+                    cur.execute("SELECT * FROM structures WHERE structure_id = ?", (next_structure_id,))
+                    next_structure = cur.fetchone()
+                    if next_structure is None:
+                        response.put_bool("success", False)
+                        response.put_utf_string("message", "Upgrade data missing")
+                        await send_extension_response(client, cmd, response)
+                        continue
+
+                    cur.execute("SELECT * FROM entities WHERE entity_id = ?", (next_structure["entity"],))
+                    next_entity = cur.fetchone()
+                    if next_entity is None:
+                        response.put_bool("success", False)
+                        response.put_utf_string("message", "Upgrade entity missing")
+                        await send_extension_response(client, cmd, response)
+                        continue
+
+                    cost_coins = next_entity["cost_coins"] or 0
+                    cost_diamonds = next_entity["cost_diamonds"] or 0
+                    cost_shards = next_entity["cost_eth_currency"] or 0
+
+                    if not client.player.add_properties(coins=-cost_coins, diamonds=-cost_diamonds, food=0, xp=0, shards=-cost_shards):
+                        response.put_bool("success", False)
+                        response.put_utf_string("message", "Not enough currency")
+                        await send_extension_response(client, cmd, response)
+                        continue
+
+                    cur_player.execute(
+                        "UPDATE player_structures SET structure = ?, date_created = ?, building_completed = ?, last_collection = ?, obj_data = ?, obj_end = ? WHERE user_structure_id = ?",
+                        (
+                            next_structure_id,
+                            current_time_ms,
+                            current_time_ms,
+                            current_time_ms,
+                            None,
+                            None,
+                            user_structure_id,
+                        )
+                    )
+                    db_player.commit()
+
+                    upgraded_structure = Structure(
+                        client.player.active_island,
+                        user_structure_id,
+                        next_structure_id,
+                        structure_row["pos_x"],
+                        structure_row["pos_y"],
+                        structure_row["flip"],
+                        structure_row["scale"],
+                        current_time_ms,
+                        current_time_ms,
+                        current_time_ms,
+                        None,
+                        None,
+                    )
+
+                    cur_player.execute(
+                        "SELECT * FROM player_structures WHERE user_structure_id = ?",
+                        (user_structure_id,)
+                    )
+                    structure_row = cur_player.fetchone()
+
+                    if structure_row:
+                        updated_structure = Structure(
+                            structure_row["user_island_id"],
+                            structure_row["user_structure_id"],
+                            structure_row["structure"],
+                            structure_row["pos_x"],
+                            structure_row["pos_y"],
+                            structure_row["flip"],
+                            structure_row["scale"],
+                            structure_row["date_created"],
+                            structure_row["building_completed"],
+                            structure_row["last_collection"],
+                            structure_row["obj_data"],
+                            structure_row["obj_end"],
+                        )
+
+                        structures_array = SFSArray()
+                        structures_array.add_sfs_object(updated_structure.get_sfs_object())
+
+                        update_resp = SFSObject()
+                        update_resp.put_sfs_array("structures", structures_array)
+
+                        await send_extension_response(client, "gs_update_structures", update_resp)
+
+                    response.put_bool("success", True)
+                    response.put_long("user_structure_id", user_structure_id)
+                    response.put_sfs_object("user_structure", upgraded_structure.get_sfs_object())
+                    response.put_sfs_array("properties", client.player.get_properties())
+                    await send_extension_response(client, cmd, response)
+                elif cmd_lower == "gs_mute_monster":
                     user_monster_id = params.get("user_monster_id")
 
                     cur_player.execute(
@@ -959,8 +1570,10 @@ async def handle_client(client: TCPTransport):
                         monster_row["volume"],
                         monster_row["date_created"],
                         monster_row["last_collection"],
-                        muted
+                        muted,
+                        name=get_monster_name(monster_row)
                     )
+                    refresh_cached_monster(client, updatedMonster)
 
                     response.put_bool("success", True)
                     response.put_long("user_monster_id", user_monster_id)
@@ -973,13 +1586,69 @@ async def handle_client(client: TCPTransport):
                     await send_extension_response(client, cmd, response2)
 
                     await send_extension_response(client, "gs_update_monster", response)
-                elif cmd == "gs_referral_request":
+                elif cmd_lower == "gs_mute_structure":
+                    user_structure_id = params.get("user_structure_id")
+
+                    cur_player.execute(
+                        "SELECT muted FROM player_structures WHERE user_structure_id = ? AND user_island_id = ?",
+                        (user_structure_id, client.player.active_island)
+                    )
+                    row_muted = cur_player.fetchone()
+
+                    response = SFSObject()
+                    if row_muted is None:
+                        response.put_bool("success", False)
+                        response.put_utf_string("error", "Invalid structure ID")
+                        await send_extension_response(client, cmd, response)
+                        continue
+
+                    muted = 0 if row_muted["muted"] == 1 else 1
+
+                    cur_player.execute(
+                        "UPDATE player_structures SET muted = ? WHERE user_structure_id = ? AND user_island_id = ?",
+                        (muted, user_structure_id, client.player.active_island)
+                    )
+                    db_player.commit()
+
+                    cur_player.execute(
+                        "SELECT * FROM player_structures WHERE user_structure_id = ? AND user_island_id = ?",
+                        (user_structure_id, client.player.active_island)
+                    )
+                    structure_row = cur_player.fetchone()
+
+                    updatedStructure = Structure(
+                        client.player.active_island,
+                        user_structure_id,
+                        structure_row["structure"],
+                        structure_row["pos_x"],
+                        structure_row["pos_y"],
+                        structure_row["flip"],
+                        structure_row["scale"],
+                        structure_row["date_created"],
+                        structure_row["building_completed"] if "building_completed" in structure_row.keys() else None,
+                        structure_row["last_collection"] if "last_collection" in structure_row.keys() else None,
+                        structure_row["obj_data"] if "obj_data" in structure_row.keys() else None,
+                        structure_row["obj_end"] if "obj_end" in structure_row.keys() else None,
+                        muted=muted,
+                    )
+
+                    response.put_bool("success", True)
+                    response.put_long("user_structure_id", user_structure_id)
+                    response.put_sfs_object("user_structure", updatedStructure.get_sfs_object())
+                    response.put_int("muted", muted)
+
+                    response2 = SFSObject()
+                    response2.put_bool("success", True)
+
+                    await send_extension_response(client, cmd, response2)
+                    await send_extension_response(client, "gs_update_structure", response)
+                elif cmd_lower == "gs_referral_request":
                     code = str(params.get("referring_bbb_id"))
 
                     response = SFSObject()
 
                     if code == "132026":
-                        worked = client.player.add_properties(coins=999_999_999,diamonds=999_999_999,food=999_999_999,shards=999_999_999,xp=0,level=30,set=True)
+                        worked = client.player.add_properties(coins=999_999_999,diamonds=0,food=999_999_999,shards=999_999_999,xp=0,level=0,set=True)
 
                         response.put_bool("success", True)
                         response.put_sfs_array("properties", client.player.get_properties())
@@ -992,7 +1661,7 @@ async def handle_client(client: TCPTransport):
                         response.put_sfs_array("properties", client.player.get_properties())
 
                         await send_extension_response(client, "gs_update_properties", response)                   
-                elif cmd == "gs_set_displayname":
+                elif cmd_lower == "gs_set_displayname":
                     displayname = params.get("newName")
 
                     if not displayname:
@@ -1025,7 +1694,7 @@ async def handle_client(client: TCPTransport):
                     response.put_bool("success", True)
                     response.put_utf_string("displayName", displayname)
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_memory_minigame_current_cost":
+                elif cmd_lower == "gs_memory_minigame_current_cost":
                     diamonds = 2
                     coins = 0
 
@@ -1035,7 +1704,7 @@ async def handle_client(client: TCPTransport):
                     response.put_bool("success", True)
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_get_memory_game_numbers":
+                elif cmd_lower == "gs_get_memory_game_numbers":
                     response = SFSObject()
                     
                     response.put_int("memoryGameAudioSampleNumber", 100)  # MEMORY_AUDIO_SAMPLE_NUM
@@ -1082,20 +1751,20 @@ async def handle_client(client: TCPTransport):
                     response.put_int("topscore", 4500)
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_collect_daily_reward":
+                elif cmd_lower == "gs_collect_daily_reward":
                     response = SFSObject()
 
                     response.put_sfs_array("properties", client.player.get_properties())
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_player_has_scratch_off":
+                elif cmd_lower == "gs_player_has_scratch_off":
                     response = SFSObject()
 
                     response.put_bool("success", False)
                     #response.put_utf_string("type", params.get("type"))
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_play_scratch_off" or cmd == "gs_purchase_scratch_off":
+                elif cmd_lower == "gs_play_scratch_off" or cmd_lower == "gs_purchase_scratch_off":
                     response = SFSObject()
 
                     response.put_bool("success", False)
@@ -1115,26 +1784,19 @@ async def handle_client(client: TCPTransport):
                     response.put_sfs_array("properties", client.player.get_properties())
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_move_monster":
+                elif cmd_lower == "gs_move_monster":
                     user_monster_id = params.get("user_monster_id")
                     new_x = params.get("pos_x")
                     new_y = params.get("pos_y")
+                    new_x = int(new_x) if new_x not in (None, "") else 1
+                    new_y = int(new_y) if new_y not in (None, "") else 1
 
                     response = SFSObject()
 
                     cur_player.execute(
                         """
-                        UPDATE player_monsters
-                        SET pos_x = ?, pos_y = ?
-                        WHERE user_monster_id = ? AND user_island_id = ?
-                        """,
-                        (new_x, new_y, user_monster_id, client.player.active_island)
-                    )
-                    db_player.commit()
-
-                    cur_player.execute(
-                        """
-                        SELECT * FROM player_monsters
+                        SELECT *
+                        FROM player_monsters
                         WHERE user_monster_id = ? AND user_island_id = ?
                         """,
                         (user_monster_id, client.player.active_island)
@@ -1147,12 +1809,41 @@ async def handle_client(client: TCPTransport):
                         await send_extension_response(client, cmd, response)
                         continue
 
+                    position_state = get_monster_position_state(client.player.active_island, user_monster_id)
+                    stale_move = (
+                        position_state is not None
+                        and (new_x, new_y) == position_state["previous"]
+                        and (new_x, new_y) != position_state["current"]
+                    )
+
+                    final_x = monster_row["pos_x"]
+                    final_y = monster_row["pos_y"]
+
+                    if not stale_move:
+                        cur_player.execute(
+                            """
+                            UPDATE player_monsters
+                            SET pos_x = ?, pos_y = ?
+                            WHERE user_monster_id = ? AND user_island_id = ?
+                            """,
+                            (new_x, new_y, user_monster_id, client.player.active_island)
+                        )
+                        db_player.commit()
+
+                        final_x = new_x
+                        final_y = new_y
+                    else:
+                        print(
+                            f"[!] rejected stale monster move for {user_monster_id} on island {client.player.active_island}: "
+                            f"requested {(new_x, new_y)} -> forcing {(final_x, final_y)}"
+                        )
+
                     updatedMonster = Monster(
                         client.player.active_island,
                         user_monster_id,
                         monster_row["monster"],
-                        new_x,
-                        new_y,
+                        final_x,
+                        final_y,
                         monster_row["flip"],
                         monster_row["level"],
                         monster_row["happiness"],
@@ -1161,14 +1852,16 @@ async def handle_client(client: TCPTransport):
                         monster_row["volume"],
                         monster_row["date_created"],
                         monster_row["last_collection"],
-                        monster_row["muted"]
+                        monster_row["muted"],
+                        name=get_monster_name(monster_row)
                     )
+                    refresh_cached_monster(client, updatedMonster)
 
                     response.put_bool("success", True)
                     response.put_long("user_monster_id", user_monster_id)
                     response.put_sfs_object("monster", updatedMonster.get_sfs_object())
-                    response.put_int("pos_x", new_x)
-                    response.put_int("pos_y", new_y)
+                    response.put_int("pos_x", final_x)
+                    response.put_int("pos_y", final_y)
 
                     response2 = SFSObject()
                     response2.put_bool("success", True)
@@ -1176,7 +1869,7 @@ async def handle_client(client: TCPTransport):
                     await send_extension_response(client, cmd, response2)
 
                     await send_extension_response(client, "gs_update_monster", response)
-                elif cmd == "gs_feed_monster":
+                elif cmd_lower == "gs_feed_monster":
                     user_monster_id = params.get("user_monster_id")
                     response = SFSObject()
 
@@ -1235,9 +1928,11 @@ async def handle_client(client: TCPTransport):
                             new_level -= 1
                             times_fed = 4
 
+                    # Each feeding grants +5 happiness, capped at 50
+                    new_happiness = min(50, (monster_row["happiness"] or 0) + 5)
                     cur_player.execute(
-                        "UPDATE player_monsters SET times_fed = ?, level = ? WHERE user_monster_id = ?",
-                        (times_fed, new_level, user_monster_id)
+                        "UPDATE player_monsters SET times_fed = ?, level = ?, happiness = ? WHERE user_monster_id = ?",
+                        (times_fed, new_level, new_happiness, user_monster_id)
                     )
                     db_player.commit()
 
@@ -1253,14 +1948,16 @@ async def handle_client(client: TCPTransport):
                         monster_row["pos_y"],
                         monster_row["flip"],
                         new_level,
-                        100,
+                        new_happiness,
                         monster_row["collected_coins"],
                         times_fed,
                         monster_row["volume"],
                         monster_row["date_created"],
                         monster_row["last_collection"],
-                        monster_row["muted"]
+                        monster_row["muted"],
+                        name=get_monster_name(monster_row)
                     )
+                    refresh_cached_monster(client, monster_obj)
 
                     response2 = SFSObject()
                     response2.put_long("user_monster_id", user_monster_id)
@@ -1280,7 +1977,7 @@ async def handle_client(client: TCPTransport):
                     response3.put_bool("success", True)
                     response3.put_sfs_array("properties", client.player.get_properties())
                     await send_extension_response(client, "gs_update_properties", response3)
-                elif cmd == "gs_collect_monster":
+                elif cmd_lower == "gs_collect_monster":
                     user_monster_id = params.get("user_monster_id")
                     response = SFSObject()
 
@@ -1315,7 +2012,7 @@ async def handle_client(client: TCPTransport):
                     max_coins = mlevel["max_coins"]
 
                     last_collection = monster_row["last_collection"] or current_time_ms
-                    time_delta_s = (current_time_ms - last_collection) / 1000  # convert ms -> seconds
+                    time_delta_s = (current_time_ms - last_collection) / 5000  
 
                     # Add any previously collected coins
                     previous_collected = monster_row["collected_coins"]
@@ -1346,7 +2043,23 @@ async def handle_client(client: TCPTransport):
                     update_response.put_bool("success", True)
                     update_response.put_long("user_monster_id", user_monster_id)
 
-                    monster_obj = Monster(client.player.active_island, user_monster_id, monster_row["monster"], monster_row["pos_x"], monster_row["pos_y"], monster_row["flip"], monster_row["level"], 50, monster_row["collected_coins"], monster_row["times_fed"], monster_row["volume"], monster_row["date_created"], monster_row["last_collection"], monster_row["muted"])
+                    monster_obj = Monster(
+                        client.player.active_island,
+                        user_monster_id,
+                        monster_row["monster"],
+                        monster_row["pos_x"],
+                        monster_row["pos_y"],
+                        monster_row["flip"],
+                        monster_row["level"],
+                        monster_row["happiness"],
+                        monster_row["collected_coins"],
+                        monster_row["times_fed"],
+                        monster_row["volume"],
+                        monster_row["date_created"],
+                        monster_row["last_collection"],
+                        monster_row["muted"],
+                        name=get_monster_name(monster_row)
+                    )
                     update_response.put_sfs_object("monster", monster_obj.get_sfs_object())
                     update_response.put_sfs_array("properties", client.player.get_properties())
                     update_response.put_long("last_collection", current_time_ms)
@@ -1357,11 +2070,24 @@ async def handle_client(client: TCPTransport):
                     props_response = SFSObject()
                     props_response.put_sfs_array("properties", client.player.get_properties())
                     await send_extension_response(client, "gs_update_properties", props_response)
-                elif cmd == "gs_mega_monster_message":
+                elif cmd_lower == "gs_mega_monster_message":
                     user_monster_id = params.get("user_monster_id")
                     permanent = params.get("permanent")
                     cost = 20 if permanent else 2
                     duration_ms = 60 * 60 * 24 * 1000
+
+                    cur_player.execute(
+                        "SELECT * FROM player_monsters WHERE user_monster_id = ? AND user_island_id = ?",
+                        (user_monster_id, client.player.active_island)
+                    )
+                    monster_row = cur_player.fetchone()
+
+                    if not monster_row:
+                        response = SFSObject()
+                        response.put_bool("success", False)
+                        response.put_utf_string("error", "Invalid monster ID")
+                        await send_extension_response(client, cmd, response)
+                        continue
 
                     cur_player.execute(
                         "DELETE FROM monster_mega_data WHERE finishes_at < ?",
@@ -1416,6 +2142,28 @@ async def handle_client(client: TCPTransport):
                                 response.put_bool("success", True)
                                 response.put_long("user_monster_id", user_monster_id)
 
+                                updatedMonster = Monster(
+                                    client.player.active_island,
+                                    user_monster_id,
+                                    monster_row["monster"],
+                                    monster_row["pos_x"],
+                                    monster_row["pos_y"],
+                                    monster_row["flip"],
+                                    monster_row["level"],
+                                    monster_row["happiness"],
+                                    monster_row["collected_coins"],
+                                    monster_row["times_fed"],
+                                    monster_row["volume"],
+                                    monster_row["date_created"],
+                                    monster_row["last_collection"],
+                                    monster_row["muted"],
+                                    mega_data=megamonster_data,
+                                    name=get_monster_name(monster_row)
+                                )
+                                refresh_cached_monster(client, updatedMonster)
+
+                                response2.put_sfs_object("monster", updatedMonster.get_sfs_object())
+
                                 await send_extension_response(client, cmd, response)
                                 await send_extension_response(client, "gs_update_monster", response2)
                                 continue
@@ -1460,13 +2208,34 @@ async def handle_client(client: TCPTransport):
                     megamonster_data = MegaData(user_monster_id, permanent, True, current_time_ms if not permanent else None, end_time if not permanent else None)
                     response2.put_sfs_object("megamonster", megamonster_data.get_sfs_object())
 
+                    updatedMonster = Monster(
+                        client.player.active_island,
+                        user_monster_id,
+                        monster_row["monster"],
+                        monster_row["pos_x"],
+                        monster_row["pos_y"],
+                        monster_row["flip"],
+                        monster_row["level"],
+                        monster_row["happiness"],
+                        monster_row["collected_coins"],
+                        monster_row["times_fed"],
+                        monster_row["volume"],
+                        monster_row["date_created"],
+                        monster_row["last_collection"],
+                        monster_row["muted"],
+                        mega_data=megamonster_data,
+                        name=get_monster_name(monster_row)
+                    )
+                    refresh_cached_monster(client, updatedMonster)
+                    response2.put_sfs_object("monster", updatedMonster.get_sfs_object())
+
                     response = SFSObject()
                     response.put_bool("success", True)
                     response.put_long("user_monster_id", user_monster_id)
 
                     await send_extension_response(client, cmd, response)
                     await send_extension_response(client, "gs_update_monster", response2)
-                elif cmd == "gs_place_on_gold_island":
+                elif cmd_lower == "gs_place_on_gold_island":
                     user_monster_id = int(params.get("user_monster_id"))
                     parent_island_id = int(params.get("user_parent_island_id"))
 
@@ -1554,7 +2323,8 @@ async def handle_client(client: TCPTransport):
                         parent_monster["last_collection"],
                         0,
                         parent_island_id=parent_island_id,
-                        parent_monster_id=parent_monster["user_monster_id"]
+                        parent_monster_id=parent_monster["user_monster_id"],
+                        name=get_monster_name(parent_monster)
                     )
 
                     cur_player.execute("""
@@ -1570,10 +2340,12 @@ async def handle_client(client: TCPTransport):
                             finishes_at=mega_data["finishes_at"] or None
                         )
 
+                    refresh_cached_monster(client, gi_monster)
+
                     response.put_sfs_object("monster", gi_monster.get_sfs_object())
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_sell_monster":
+                elif cmd_lower == "gs_sell_monster":
                     user_monster_id = params.get("user_monster_id")
 
                     cur_player.execute(
@@ -1584,10 +2356,24 @@ async def handle_client(client: TCPTransport):
                         (user_monster_id, client.player.active_island)
                     )
 
-                    monster_id = cur_player.fetchone()["monster"]
+                    player_monster = cur_player.fetchone()
+                    if not player_monster:
+                        response = SFSObject()
+                        response.put_bool("success", False)
+                        response.put_utf_string("error", "Invalid monster ID")
+                        await send_extension_response(client, cmd, response)
+                        continue
+
+                    monster_id = player_monster["monster"]
 
                     cur.execute("SELECT * FROM monsters WHERE monster_id = ?", (monster_id,))
                     row = cur.fetchone()
+                    if not row:
+                        response = SFSObject()
+                        response.put_bool("success", False)
+                        response.put_utf_string("error", "Invalid monster data")
+                        await send_extension_response(client, cmd, response)
+                        continue
 
                     sell_entity(client, row["entity"])
 
@@ -1606,7 +2392,7 @@ async def handle_client(client: TCPTransport):
                     response.put_sfs_array("properties", client.player.get_properties())
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_sell_structure":
+                elif cmd_lower == "gs_sell_structure":
                     user_structure_id = params.get("user_structure_id")
 
                     cur_player.execute(
@@ -1638,7 +2424,7 @@ async def handle_client(client: TCPTransport):
                     response.put_sfs_array("properties", client.player.get_properties())
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_clear_obstacle":
+                elif cmd_lower == "gs_clear_obstacle":
                     user_structure_id = params.get("user_structure_id")
 
                     cur_player.execute(
@@ -1659,15 +2445,34 @@ async def handle_client(client: TCPTransport):
                         continue
 
                     structure_id = structure_row["structure"]
-
+                    # Fetch static structure/entity data (cost + xp reward)
                     cur.execute("SELECT * FROM structures WHERE structure_id = ?", (structure_id,))
-                    row = cur.fetchone()
+                    struct_static = cur.fetchone()
 
-                    cur.execute("SELECT * FROM entities WHERE entity_id = ?", (row["entity"],))
-                    row = cur.fetchone()
+                    cur.execute("SELECT * FROM entities WHERE entity_id = ?", (struct_static["entity"],))
+                    entity_row = cur.fetchone()
 
-                    worked = client.player.add_properties(0, 0, 0, row["xp"], 0)
+                    # Deduct the clearing cost before removing the obstacle
+                    cost_coins = 0
+                    cost_diamonds = 0
+                    if entity_row is not None:
+                        try:
+                            cost_coins = entity_row["cost_coins"] or 0
+                        except Exception:
+                            cost_coins = 0
+                        try:
+                            cost_diamonds = entity_row["cost_diamonds"] or 0
+                        except Exception:
+                            cost_diamonds = 0
 
+                    if not client.player.add_properties(coins=-cost_coins, diamonds=-cost_diamonds):
+                        response = SFSObject()
+                        response.put_bool("success", False)
+                        response.put_utf_string("error", "Not enough resources to clear obstacle")
+                        await send_extension_response(client, cmd, response)
+                        continue
+
+                    # Attempt to delete — do this after cost check to avoid race conditions
                     cur_player.execute(
                         """
                         DELETE FROM player_structures
@@ -1677,13 +2482,33 @@ async def handle_client(client: TCPTransport):
                     )
                     db_player.commit()
 
+                    # If no row was deleted, the obstacle was already removed — refund
+                    if cur_player.rowcount == 0:
+                        client.player.add_properties(coins=cost_coins, diamonds=cost_diamonds)
+                        response = SFSObject()
+                        response.put_bool("success", False)
+                        response.put_utf_string("error", "Structure already removed")
+                        await send_extension_response(client, cmd, response)
+                        continue
+
+                    # Award XP only after successful deletion
+                    xp_reward = 0
+                    if entity_row is not None:
+                        try:
+                            xp_reward = entity_row["xp"] or 0
+                        except Exception:
+                            xp_reward = 0
+
+                    if xp_reward:
+                        client.player.add_properties(0, 0, 0, xp_reward, 0)
+
                     response = SFSObject()
                     response.put_bool("success", True)
                     response.put_long("user_structure_id", user_structure_id)
                     response.put_sfs_array("properties", client.player.get_properties())
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_move_structure":
+                elif cmd_lower == "gs_move_structure":
                     user_structure_id = params.get("user_structure_id")
                     new_x = params.get("pos_x")
                     new_y = params.get("pos_y")
@@ -1708,9 +2533,25 @@ async def handle_client(client: TCPTransport):
                     structure_id = row["structure"]
                     flip = row["flip"]
                     date_created = row["date_created"]
+                    building_completed = row["building_completed"]
                     last_collection = row["last_collection"]
+                    obj_data = row["obj_data"] if "obj_data" in row.keys() else None
+                    obj_end = row["obj_end"] if "obj_end" in row.keys() else None
 
-                    newStructure = Structure(client.player.active_island, user_structure_id, structure_id, new_x, new_y, flip, scale, date_created)
+                    newStructure = Structure(
+                        client.player.active_island,
+                        user_structure_id,
+                        structure_id,
+                        new_x,
+                        new_y,
+                        flip,
+                        scale,
+                        date_created,
+                        building_completed,
+                        last_collection,
+                        obj_data,
+                        obj_end,
+                    )
                     prop = SFSObject()
                     prop.put_int("pos_x", new_x)
                     properties.add_sfs_object(prop)
@@ -1729,7 +2570,7 @@ async def handle_client(client: TCPTransport):
                     response.put_sfs_object("user_structure", newStructure.get_sfs_object())
                     response.put_bool("success", True)
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_flip_structure":
+                elif cmd_lower == "gs_flip_structure":
                     user_structure_id = params.get("user_structure_id")
 
                     cur_player.execute(
@@ -1761,7 +2602,11 @@ async def handle_client(client: TCPTransport):
                         row["pos_y"],
                         new_flip,
                         row["scale"],
-                        row["date_created"]
+                        row["date_created"],
+                        row["building_completed"] if "building_completed" in row.keys() else None,
+                        row["last_collection"] if "last_collection" in row.keys() else None,
+                        row["obj_data"] if "obj_data" in row.keys() else None,
+                        row["obj_end"] if "obj_end" in row.keys() else None,
                     )
 
                     flip_resp = SFSObject()
@@ -1777,7 +2622,7 @@ async def handle_client(client: TCPTransport):
                     update_resp.put_sfs_array("properties", props)
                     update_resp.put_bool("success", True)
                     await send_extension_response(client, "gs_update_structure", update_resp)
-                elif cmd == "gs_flip_monster":
+                elif cmd_lower == "gs_flip_monster":
                     user_monster_id = params.get("user_monster_id")
                     flipped = params.get("flipped")
 
@@ -1827,7 +2672,8 @@ async def handle_client(client: TCPTransport):
                         monster_row["volume"],
                         monster_row["date_created"],
                         monster_row["last_collection"],
-                        monster_row["muted"]
+                        monster_row["muted"],
+                        name=get_monster_name(monster_row)
                     )
 
                     flip_resp = SFSObject()
@@ -1840,20 +2686,96 @@ async def handle_client(client: TCPTransport):
                     update_resp.put_int("flip", new_flip)
                     update_resp.put_sfs_object("monster", updatedMonster.get_sfs_object())
                     await send_extension_response(client, "gs_update_monster", update_resp)
-                elif cmd == "gs_collect_scratch_off":
+                elif cmd_lower == "gs_collect_scratch_off":
                     response = SFSObject()
 
                     response.put_bool("success", True)
                     response.put_sfs_array("properties", client.player.get_properties())
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_name_monster":
-                    msg = SFSObject()
-                    msg.put_bool("force_logout", True)
-                    msg.put_utf_string("msg", "Please don't change the name, it helps advertise me (riotlove) because other people try and claim the server as their own :(")
+                elif cmd_lower == "gs_name_monster":
+                    user_monster_id = params.get("user_monster_id")
+                    monster_name = params.get("name") or params.get("monster_name") or params.get("newName")
+                    response = SFSObject()
 
-                    await send_extension_response(client, "gs_display_generic_message", msg)
-                elif cmd == "gs_collect_from_mine":
+                    if not user_monster_id:
+                        response.put_bool("success", False)
+                        response.put_utf_string("error", "Invalid monster ID")
+                        await send_extension_response(client, cmd, response)
+                        continue
+
+                    if monster_name is None:
+                        response.put_bool("success", False)
+                        response.put_utf_string("error", "Invalid monster name")
+                        await send_extension_response(client, cmd, response)
+                        continue
+
+                    monster_name = sanitize_name(str(monster_name), ALPHABET).strip()
+                    invalid_reason = invalid_name(monster_name)
+                    if invalid_reason:
+                        response.put_bool("success", False)
+                        response.put_utf_string("error", invalid_reason)
+                        await send_extension_response(client, cmd, response)
+                        continue
+
+                    cur_player.execute(
+                        "SELECT * FROM player_monsters WHERE user_monster_id = ? AND user_island_id = ?",
+                        (user_monster_id, client.player.active_island)
+                    )
+                    monster_row = cur_player.fetchone()
+
+                    if not monster_row:
+                        response.put_bool("success", False)
+                        response.put_utf_string("error", "Invalid monster ID")
+                        await send_extension_response(client, cmd, response)
+                        continue
+
+                    cur_player.execute(
+                        "UPDATE player_monsters SET name = ? WHERE user_monster_id = ? AND user_island_id = ?",
+                        (monster_name, user_monster_id, client.player.active_island)
+                    )
+                    db_player.commit()
+
+                    active_island = client.player.get_active_island()
+                    if active_island:
+                        target_monster = active_island.find_monster(user_monster_id)
+                        if target_monster:
+                            target_monster.name = monster_name
+
+                    response.put_bool("success", True)
+                    await send_extension_response(client, cmd, response)
+
+                    cur_player.execute(
+                        "SELECT * FROM player_monsters WHERE user_monster_id = ? AND user_island_id = ?",
+                        (user_monster_id, client.player.active_island)
+                    )
+                    updated_monster_row = cur_player.fetchone()
+
+                    if updated_monster_row:
+                        updated_monster = Monster(
+                            client.player.active_island,
+                            updated_monster_row["user_monster_id"],
+                            updated_monster_row["monster"],
+                            updated_monster_row["pos_x"],
+                            updated_monster_row["pos_y"],
+                            updated_monster_row["flip"],
+                            updated_monster_row["level"],
+                            updated_monster_row["happiness"],
+                            updated_monster_row["collected_coins"],
+                            updated_monster_row["times_fed"],
+                            updated_monster_row["volume"],
+                            updated_monster_row["date_created"],
+                            updated_monster_row["last_collection"],
+                            updated_monster_row["muted"],
+                            name=get_monster_name(updated_monster_row)
+                        )
+
+                        update_resp = SFSObject()
+                        update_resp.put_bool("success", True)
+                        update_resp.put_long("user_monster_id", user_monster_id)
+                        update_resp.put_sfs_object("monster", updated_monster.get_sfs_object())
+                        await send_extension_response(client, "gs_update_monster", update_resp)
+                elif cmd_lower == "gs_collect_from_mine":
                     user_structure_id = params.get("user_structure_id")
                     response = SFSObject()
 
@@ -1863,7 +2785,7 @@ async def handle_client(client: TCPTransport):
                     response.put_sfs_array("properties", client.player.get_properties())
 
                     await send_extension_response(client, "gs_update_structure", response)
-                elif cmd == "gs_get_torchgifts":
+                elif cmd_lower == "gs_get_torchgifts":
                     response = SFSObject()
                     
                     response.put_bool("success", True)
@@ -1879,7 +2801,52 @@ async def handle_client(client: TCPTransport):
                     response.put_sfs_array("properties", properties_array)
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_breed_monsters":
+                elif cmd_lower == "gs_light_torch":
+                    response = SFSObject()
+
+                    is_permanent = bool(
+                        params.get("permanent")
+                        or params.get("is_permanent")
+                        or params.get("permalit")
+                    )
+                    cost_key = (
+                        "USER_DIAMOND_COST_PER_PERMALIT_TORCH"
+                        if is_permanent
+                        else "USER_DIAMOND_COST_PER_LIT_TORCH"
+                    )
+                    try:
+                        cost = int(float(get_game_setting_from_key(cost_key) or (100 if is_permanent else 2)))
+                    except (TypeError, ValueError):
+                        cost = 100 if is_permanent else 2
+
+                    if not client.player.add_properties(diamonds=-cost):
+                        response.put_bool("success", False)
+                        response.put_utf_string("error", "Not enough diamonds")
+                        await send_extension_response(client, cmd, response)
+                        continue
+
+                    response.put_bool("success", True)
+                    response.put_long("user_island_id", int(params.get("user_island_id") or client.player.active_island))
+                    response.put_utf_string("animation", "light_torch")
+                    response.put_sfs_array("properties", client.player.get_properties())
+
+                    system_payload = SFSObject()
+                    system_payload.put_bool("force_logout", False)
+                    system_payload.put_utf_string("msg", "Torch lit successfully.")
+                    response.put_sfs_object("system", system_payload)
+
+                    animations = SFSArray()
+                    animation = SFSObject()
+                    animation.put_utf_string("animation", "light_torch")
+                    animation.put_utf_string("animation_alias", "torch_lighting")
+                    animation.put_long("user_island_id", int(params.get("user_island_id") or client.player.active_island))
+                    animations.add_sfs_object(animation)
+                    response.put_sfs_array("animations", animations)
+
+                    await send_extension_response(client, cmd, response)
+
+                    await send_extension_response(client, "gs_display_generic_message", system_payload)
+                elif cmd_lower == "gs_breed_monsters":
                     user_monster_id_1 = params.get("user_monster_id_1")
                     user_monster_id_2 = params.get("user_monster_id_2")
                     cur_player.execute(
@@ -1958,7 +2925,7 @@ async def handle_client(client: TCPTransport):
                     response.put_sfs_object("user_breeding", user_breeding.get_sfs_object())
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_finish_breeding":
+                elif cmd_lower == "gs_finish_breeding":
                     response = SFSObject()
 
                     user_breeding_id = params.get("user_breeding_id")
@@ -2018,7 +2985,7 @@ async def handle_client(client: TCPTransport):
                     response.put_long("user_breeding_id", user_breeding_id)
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_speed_up_breeding":
+                elif cmd_lower == "gs_speed_up_breeding":
                     user_breeding_id = params.get("user_breeding_id")
 
                     response = SFSObject()
@@ -2048,7 +3015,7 @@ async def handle_client(client: TCPTransport):
                     response.put_long("started_on", row["started_on"])
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_player":
+                elif cmd_lower == "gs_player":
                     response = SFSObject()
 
                     response.put_sfs_object("player_object", client.player.get_sfs_object())
@@ -2056,7 +3023,7 @@ async def handle_client(client: TCPTransport):
                     print(response)
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_get_island_rank":
+                elif cmd_lower == "gs_get_island_rank":
                     response = SFSObject()
 
                     user_island_id = params.get("island_id")
@@ -2104,7 +3071,7 @@ async def handle_client(client: TCPTransport):
                         response.put_bool("success", False)
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_get_friend_visit_data":
+                elif cmd_lower == "gs_get_friend_visit_data":
                     friend_id = params.get("user_id")
 
                     response = SFSObject()
@@ -2141,7 +3108,7 @@ async def handle_client(client: TCPTransport):
                     response.put_sfs_object("friend_object", friendPlayer.get_sfs_object())
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_get_ranked_island_data":
+                elif cmd_lower == "gs_get_ranked_island_data":
                     offset = params.get("weekly_rank") - 1
 
                     cur_player.execute("""
@@ -2201,7 +3168,7 @@ async def handle_client(client: TCPTransport):
                     response.put_bool("success", True)
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_get_random_visit_data":
+                elif cmd_lower == "gs_get_random_visit_data":
                     cur_player.execute("""
                         SELECT * FROM player_islands
                         ORDER BY RANDOM()
@@ -2244,7 +3211,7 @@ async def handle_client(client: TCPTransport):
                     response.put_bool("success", True)
 
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_rate_island":
+                elif cmd_lower == "gs_rate_island":
                     liked = params.get("liked")
                     column = "likes" if liked else "dislikes"
 
@@ -2259,7 +3226,7 @@ async def handle_client(client: TCPTransport):
                     response = SFSObject()
                     response.put_bool("success", True)
                     await send_extension_response(client, cmd, response)
-                elif cmd == "gs_currency_conversion":
+                elif cmd_lower == "gs_currency_conversion":
                     # 50,1000000
 
                     if client.player.add_properties(diamonds=-50) != True:
@@ -2271,7 +3238,7 @@ async def handle_client(client: TCPTransport):
                     response.put_sfs_array("properties", client.player.get_properties())
 
                     await send_extension_response(client, "gs_update_properties", response)
-                elif cmd == "gs_currency_coins2eth_conversion":
+                elif cmd_lower == "gs_currency_coins2eth_conversion":
                     # 500000,50
 
                     if client.player.add_properties(coins=-500000) != True:
@@ -2284,7 +3251,7 @@ async def handle_client(client: TCPTransport):
                     response.put_sfs_array("properties", client.player.get_properties())
 
                     await send_extension_response(client, "gs_update_properties", response)
-                elif cmd == "gs_currency_diamonds2eth_conversion":
+                elif cmd_lower == "gs_currency_diamonds2eth_conversion":
                     # 50,100
 
                     if client.player.add_properties(diamonds=-50) != True:
@@ -2297,7 +3264,7 @@ async def handle_client(client: TCPTransport):
                     response.put_sfs_array("properties", client.player.get_properties())
 
                     await send_extension_response(client, "gs_update_properties", response)
-                elif cmd == "gs_currency_eth2diamonds_conversion":
+                elif cmd_lower == "gs_currency_eth2diamonds_conversion":
                     # 30000,1
 
                     if client.player.add_properties(shards=-30000) != True:
@@ -2310,7 +3277,176 @@ async def handle_client(client: TCPTransport):
                     response.put_sfs_array("properties", client.player.get_properties())
 
                     await send_extension_response(client, "gs_update_properties", response)
-                elif cmd == "keep_alive" or cmd == "gs_multi_neighbors" or cmd == "gs_get_messages" or cmd == "gs_handle_facebook_help_instances" or cmd == "gs_process_unclaimed_purchases":
+                elif cmd in ("g5_send_monster_home", "gs_send_monster_home"):
+                    user_monster_id = params.get("user_monster_id")
+                    response = SFSObject()
+
+                    if not user_monster_id:
+                        response.put_bool("success", False)
+                        response.put_utf_string("error", "Invalid monster ID")
+                        await send_extension_response(client, cmd, response)
+                        continue
+
+                    cur_player.execute(
+                        "SELECT * FROM player_monsters WHERE user_monster_id = ? AND user_island_id = ?",
+                        (user_monster_id, client.player.active_island)
+                    )
+                    monster_row = cur_player.fetchone()
+                    was_gi_monster = False
+
+                    if not monster_row:
+                        cur_player.execute(
+                            "SELECT * FROM player_gi_monsters WHERE user_monster_id = ? AND bbb_id = ?",
+                            (user_monster_id, client.player.bbb_id)
+                        )
+                        gi_row = cur_player.fetchone()
+                        if gi_row:
+                            cur_player.execute(
+                                "SELECT * FROM player_monsters WHERE user_monster_id = ?",
+                                (gi_row["monster_parent_id"],)
+                            )
+                            monster_row = cur_player.fetchone()
+                            was_gi_monster = True
+
+                    if not monster_row:
+                        response.put_bool("success", False)
+                        response.put_utf_string("error", "Invalid monster ID")
+                        await send_extension_response(client, cmd, response)
+                        continue
+
+                    monster_id = monster_row["monster"]
+                    original_island_id = monster_row["user_island_id"]
+
+                    if was_gi_monster:
+                        cur_player.execute(
+                            "DELETE FROM player_gi_monsters WHERE user_monster_id = ? AND bbb_id = ?",
+                            (user_monster_id, client.player.bbb_id)
+                        )
+                    else:
+                        cur_player.execute(
+                            "DELETE FROM player_monsters WHERE user_monster_id = ? AND user_island_id = ?",
+                            (user_monster_id, client.player.active_island)
+                        )
+                    db_player.commit()
+
+                    target_island_id = SHUGGA_ISLAND_ID
+                    cur_player.execute(
+                        "SELECT island_id FROM player_islands WHERE user_island_id = ?",
+                        (original_island_id,)
+                    )
+                    origin_island_row = cur_player.fetchone()
+                    if origin_island_row:
+                        static_cur.execute(
+                            "SELECT dest_island FROM monster_island_2_island_map WHERE source_island = ? AND source_monster = ?",
+                            (origin_island_row["island_id"], monster_id)
+                        )
+                        mapping_row = static_cur.fetchone()
+                        if mapping_row:
+                            target_island_id = mapping_row["dest_island"]
+
+                    cur_player.execute(
+                        "SELECT user_island_id FROM player_islands WHERE bbb_id = ? AND island_id = ?",
+                        (client.player.bbb_id, target_island_id)
+                    )
+                    target_row = cur_player.fetchone()
+
+                    if not target_row:
+                        cur_player.execute(
+                            "INSERT INTO player_islands (bbb_id, date_created, island_id) VALUES (?, ?, ?)",
+                            (client.player.bbb_id, current_time_ms, target_island_id)
+                        )
+                        db_player.commit()
+                        target_user_island_id = cur_player.lastrowid
+                        new_island = Island(client.player.bbb_id, target_island_id, target_user_island_id)
+                        new_island.create_structures()
+                        client.player.add_island(new_island)
+                    else:
+                        target_user_island_id = target_row["user_island_id"]
+
+                    cur_player.execute(
+                        "SELECT * FROM player_structures WHERE user_island_id = ? AND structure = 1 AND is_complete = 1 LIMIT 1",
+                        (target_user_island_id,)
+                    )
+                    structure_row = cur_player.fetchone()
+
+                    if not structure_row:
+                        cur_player.execute(
+                            "INSERT INTO player_structures (user_island_id, date_created, pos_x, pos_y, flip, muted, is_complete, is_upgrading, structure, scale, building_completed, last_collection, obj_data, obj_end) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (target_user_island_id, current_time_ms, 35, 17, 0, 0, 0, 0, 1, 1.0, current_time_ms, current_time_ms, 0, 0)
+                        )
+                        db_player.commit()
+                        cur_player.execute(
+                            "SELECT * FROM player_structures WHERE user_island_id = ? AND structure = 1 AND user_structure_id = ?",
+                            (target_user_island_id, cur_player.lastrowid)
+                        )
+                        structure_row = cur_player.fetchone()
+
+                    hatch_time = current_time_ms
+                    cur.execute("SELECT * FROM monsters WHERE monster_id = ?", (monster_id,))
+                    static_monster = cur.fetchone()
+                    if static_monster:
+                        cur.execute("SELECT * FROM entities WHERE entity_id = ?", (static_monster["entity"],))
+                        entity_row = cur.fetchone()
+                        if entity_row:
+                            hatch_time = current_time_ms + (entity_row["build_time"] * 1000)
+
+                    user_egg_id = None
+                    egg = None
+                    if structure_row:
+                        cur_player.execute(
+                            "INSERT INTO player_eggs (user_island_id, laid_on, hatches_on, monster, user_structure_id) VALUES (?, ?, ?, ?, ?)",
+                            (target_user_island_id, current_time_ms, hatch_time, monster_id, structure_row["user_structure_id"])
+                        )
+                        db_player.commit()
+                        user_egg_id = cur_player.lastrowid
+                        egg = Egg(target_user_island_id, current_time_ms, hatch_time, monster_id, user_egg_id, structure_row["user_structure_id"])
+
+                        if client.player.active_island == target_user_island_id:
+                            plrisland = client.player.get_active_island()
+                            if plrisland:
+                                plrisland.add_egg(egg)
+
+                    if client.player.active_island != target_user_island_id:
+                        cur_player.execute(
+                            "UPDATE players SET active_island = ? WHERE bbb_id = ?",
+                            (target_user_island_id, client.player.bbb_id)
+                        )
+                        db_player.commit()
+                        client.player.active_island = target_user_island_id
+
+                    response.put_bool("success", True)
+                    response.put_long("user_monster_id", user_monster_id)
+                    response.put_long("monster_id", monster_id)
+                    response.put_long("user_island_id", target_user_island_id)
+                    response.put_utf_string("animation", "egg_laying")
+                    response.put_sfs_array("properties", client.player.get_properties())
+                    if egg is not None:
+                        response.put_long("user_egg_id", user_egg_id)
+                        response.put_sfs_object("user_egg", egg.get_sfs_object())
+
+                    await send_extension_response(client, cmd, response)
+
+                    change_response = SFSObject()
+                    change_response.put_bool("success", True)
+                    change_response.put_long("user_island_id", target_user_island_id)
+
+                    island_to_send = Island(client.player.bbb_id, target_island_id, target_user_island_id)
+                    island_to_send.add_player_monsters()
+                    island_to_send.add_player_structures()
+                    island_to_send.add_player_eggs()
+                    island_to_send.add_player_breedings()
+                    change_response.put_sfs_object("user_island", island_to_send.get_sfs_object())
+
+                    hidden_objects = SFSObject()
+                    hidden_objects.put_sfs_array("objects", SFSArray())
+                    change_response.put_sfs_object("hidden_objects", hidden_objects)
+                    await send_extension_response(client, "gs_change_island", change_response)
+
+                    system_msg = SFSObject()
+                    system_msg.put_bool("force_logout", False)
+                    system_msg.put_utf_string("msg", "Monster sent home and an egg appeared on Ethereal Island.")
+                    await send_extension_response(client, "gs_display_generic_message", system_msg)
+                elif cmd_lower == "keep_alive" or cmd_lower == "gs_multi_neighbors" or cmd_lower == "gs_get_messages" or cmd_lower == "gs_handle_facebook_help_instances" or cmd_lower == "gs_process_unclaimed_purchases":
                     response = SFSObject()
                     await send_extension_response(client, cmd, response)
                 else:
@@ -2331,15 +3467,39 @@ async def handle_client(client: TCPTransport):
         traceback.print_exc()
     finally:
         CURRENT_PLAYERS -= 1
+        try:
+            if hasattr(client, "player") and getattr(client, "player") is not None:
+                CONNECTED_CLIENTS.pop(client.player.bbb_id, None)
+        except Exception:
+            pass
         print(f"Client {client.host}:{client.port} disconnected")
 
 async def run_server(ip: str, port: int):
+    global EVENT_LOOP
+    EVENT_LOOP = asyncio.get_running_loop()
+    threading.Thread(target=admin_console_loop, daemon=True).start()
     print(f"Began server at {ip}:{port}")
+    asyncio.create_task(poll_pending_commands())
     async for client in server_from_url(f"tcp://{ip}:{port}"):
         print(f"New client connected: {client.host}:{client.port}")
         asyncio.create_task(handle_client(client))
 
 if __name__ == "__main__":
     create_player_tables()
+    reset_all_player_stats()
     load_static_data()
-    asyncio.run(run_server(GAME_SERVER_IP, 9933))
+    tried_addrs = [GAME_SERVER_IP, "0.0.0.0", "127.0.0.1"]
+    bound = False
+    for addr in tried_addrs:
+        try:
+            print(f"Attempting to start game server on {addr}:9933")
+            asyncio.run(run_server(addr, 9933))
+            bound = True
+            break
+        except OSError as e:
+            print(f"[!] failed to bind to {addr}:9933: {e}")
+        except Exception as e:
+            print(f"[!] server error while binding to {addr}:9933: {e}")
+
+    if not bound:
+        print("[!] could not bind game server to any address; check network interfaces and permissions")

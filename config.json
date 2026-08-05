@@ -1,4 +1,6 @@
 {
     "key": "3f8a1b2c4d5e6f70",
-    "iv": "1a2b3c4d5e6f7081"
+    "iv": "1a2b3c4d5e6f7081",
+    "max_players": 200,
+    "server_ip": "10.128.0.3"
 }
